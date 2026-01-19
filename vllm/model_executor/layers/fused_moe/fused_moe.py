@@ -14,6 +14,8 @@ import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
 )
@@ -2285,6 +2287,227 @@ class TritonWNA16Experts(TritonExperts):
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)
+
+
+class GPTQFusedExperts(mk.FusedMoEPermuteExpertsUnpermute):
+    """
+    Fused GPTQ MoE expert implementation using the new gptq_moe_gemm CUDA kernel.
+    This uses the MoE alignment infrastructure for efficient token routing.
+    
+    Requirements:
+    - Symmetric 4-bit quantization only
+    - Volta+ GPUs (SM 7.0+)
+    - Weights must be preprocessed with ops.gptq_shuffle
+    - Weight layout: [E, K/8, N] (not transposed)
+    """
+
+    def __init__(
+        self,
+        quant_config: FusedMoEQuantConfig,
+        w13_qzeros: torch.Tensor,
+        w2_qzeros: torch.Tensor,
+        w13_g_idx: torch.Tensor,
+        w2_g_idx: torch.Tensor,
+        w13_g_idx_sort_indices: torch.Tensor | None = None,
+        w2_g_idx_sort_indices: torch.Tensor | None = None,
+        # Scaling Override (New)
+        w1_scales: torch.Tensor | None = None,
+        w2_scales: torch.Tensor | None = None,
+        shared_w1_weight: torch.Tensor | None = None,
+        shared_w1_scale: torch.Tensor | None = None,
+        shared_w1_qzeros: torch.Tensor | None = None,
+        shared_w2_weight: torch.Tensor | None = None,
+        shared_w2_scale: torch.Tensor | None = None,
+        shared_w2_qzeros: torch.Tensor | None = None,
+    ):
+        super().__init__(quant_config)
+        self.w13_qzeros = w13_qzeros
+        self.w2_qzeros = w2_qzeros
+        self.w13_g_idx = w13_g_idx
+        self.w2_g_idx = w2_g_idx
+        # Store permutation indices (argsort(g_idx)) for input gathering
+        # If not provided, will be computed from g_idx if needed
+        self.w13_g_idx_sort_indices = w13_g_idx_sort_indices
+        self.w2_g_idx_sort_indices = w2_g_idx_sort_indices
+        
+        # Shared expert parameters
+        self.shared_w1_weight = shared_w1_weight
+        self.shared_w1_scale = shared_w1_scale
+        self.shared_w1_qzeros = shared_w1_qzeros
+        self.shared_w2_weight = shared_w2_weight
+        self.shared_w2_scale = shared_w2_scale
+        self.shared_w2_qzeros = shared_w2_qzeros
+
+    @property
+    def activation_formats(
+        self,
+    ) -> tuple[mk.FusedMoEActivationFormat, mk.FusedMoEActivationFormat]:
+        return (
+            mk.FusedMoEActivationFormat.Standard,
+            mk.FusedMoEActivationFormat.Standard,
+        )
+
+    def supports_chunking(self) -> bool:
+        return False
+
+    def supports_expert_map(self) -> bool:
+        return True
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        return TopKWeightAndReduceNoOP()
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: str,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        """Return workspace shapes for intermediate buffers."""
+        activation_out_dim = self.adjust_N_for_activation(N, activation)
+        workspace1 = (M * topk, activation_out_dim)
+        workspace2 = (M * topk, activation_out_dim)
+        output = (M, K)
+        return (workspace1, workspace2, output)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: str,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        """Apply fused GPTQ MoE using the gptq_moe_gemm CUDA kernel."""
+        num_tokens, hidden_size = hidden_states.shape
+        num_experts = w1.shape[0]
+        # w1 is [E, K/8, 2*intermediate] (GPTQ layout, not transposed)
+        intermediate_size = w1.shape[2] // 2
+        top_k = topk_ids.shape[1]
+
+        if global_num_experts == -1:
+            global_num_experts = num_experts
+
+        # Get scales from quant_config - [E, K/group, N] layout
+        # If explicit scales are provided (e.g. for scaling overrides), use them.
+        w1_scales = w1_scales if w1_scales is not None else self.w1_scale
+        w2_scales = w2_scales if w2_scales is not None else self.w2_scale
+
+        # Compute MoE alignment
+        BLOCK_SIZE_M = 32
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, BLOCK_SIZE_M, global_num_experts, expert_map, pad_sorted_ids=True
+        )
+
+        # Volta-optimized block sizes
+        BLOCK_SIZE_N = 32
+        BLOCK_SIZE_K = 128  # Auto-adjusted by kernel if needed
+
+        # Stage 1: Gate_up projection (X @ W1)
+        gate_up_output = torch.zeros(
+            (num_tokens * top_k, 2 * intermediate_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        # Pass permutation indices for input gathering (if available)
+        # For STATIC/WEIGHT models, weights are shuffled using argsort(g_idx),
+        # FORENSIC ANALYSIS: "Shuffled Weight, Unshuffled Input" Fix
+        # When weights are shuffled via gptq_shuffle, input must be gathered using the same permutation
+        # to align input features with their corresponding shuffled weights.
+        w13_q_perm = None
+        if self.w13_g_idx_sort_indices is not None and self.w13_g_idx_sort_indices.shape[1] > 0:
+            # Use first expert's permutation (all experts typically use same permutation for STATIC)
+            # gptq_shuffle does: w_new[k] = w_old[q_perm[k]] where q_perm = argsort(g_idx)
+            # So shuffled position k contains original weight at q_perm[k]
+            # For GEMM: Output = Input @ Weight_shuffled
+            # We need: Input[k] * Weight_shuffled[k] = Input_original[q_perm[k]] * Weight_original[q_perm[k]]
+            # Since Weight_shuffled[k] = Weight_original[q_perm[k]], we need:
+            # Input[k] = Input_original[q_perm[k]]
+            # So we use q_perm directly (matching standard GPTQ behavior)
+            sort_indices = self.w13_g_idx_sort_indices[0]
+            w13_q_perm = sort_indices
+
+        ops.moe_w4a16_gptq_gemm(
+            hidden_states,
+            gate_up_output,
+            w1,  # [E, K/8, 2*intermediate] (GPTQ layout)
+            w1_scales,  # [E, K/group, 2*intermediate]
+            self.w13_qzeros,  # [E, K/group, (2*intermediate)/8]
+            None,  # topk_weights (not applied in W1 stage)
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            w13_q_perm,  # Permutation for input gathering
+            False, # input_is_expanded (False: input is collapsed M, use idx/topk)
+            True,  # output_is_expanded (True: output is expanded M*topk, use idx/1)
+            self.shared_w1_weight,
+            self.shared_w1_scale,
+            self.shared_w1_qzeros,
+        )
+
+        # Split gate and up, apply activation
+        gate = gate_up_output[:, :intermediate_size]
+        up = gate_up_output[:, intermediate_size:]
+
+        if activation == "silu":
+            activated = torch.nn.functional.silu(gate) * up
+        elif activation == "gelu":
+            activated = torch.nn.functional.gelu(gate) * up
+        else:
+            activated = gate * up
+
+        # Stage 2: Down projection (activated @ W2)
+        output.zero_()
+        # Pass permutation indices for input gathering (if available)
+        # FORENSIC ANALYSIS: Same fix for w2 (down projection)
+        w2_q_perm = None
+        if self.w2_g_idx_sort_indices is not None and self.w2_g_idx_sort_indices.shape[1] > 0:
+            # Use first expert's permutation (all experts typically use same permutation for STATIC)
+            # Use direct permutation (same logic as w13)
+            sort_indices = self.w2_g_idx_sort_indices[0]
+            # Use direct permutation (same logic as w13)
+            w2_q_perm = sort_indices
+
+        ops.moe_w4a16_gptq_gemm(
+            activated,
+            output,
+            w2,  # [E, intermediate/8, hidden_size] (GPTQ layout)
+            w2_scales,  # [E, intermediate/group, hidden_size]
+            self.w2_qzeros,  # [E, intermediate/group, hidden_size/8]
+            topk_weights if not apply_router_weight_on_input else None,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_K,
+            w2_q_perm,  # Permutation for input gathering
+            True,  # input_is_expanded (True: input is expanded M*topk, use idx/1)
+            False, # output_is_expanded (False: output is collapsed M, use idx/topk)
+            self.shared_w2_weight,
+            self.shared_w2_scale,
+            self.shared_w2_qzeros,
+        )
 
 
 def modular_triton_fused_moe(

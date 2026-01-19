@@ -63,6 +63,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_wna16_gemm", torch::kCUDA, &moe_wna16_gemm);
 
   m.def(
+      "moe_w4a16_gptq_gemm(Tensor input, Tensor! output, Tensor qweight, "
+      "Tensor scales, Tensor qzeros, Tensor? topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_pad, int top_k, int BLOCK_SIZE_M, "
+      "int BLOCK_SIZE_N, int BLOCK_SIZE_K, Tensor? q_perm, "
+      "bool input_is_expanded, bool output_is_expanded, "
+      "Tensor? shared_qweight, Tensor? shared_scales, Tensor? shared_qzeros, Tensor global_work_counter) -> Tensor");
+  m.impl("moe_w4a16_gptq_gemm", torch::kCUDA, &moe_w4a16_gptq_gemm);
+
+  m.def(
       "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
       "Tensor! b_q_weight, Tensor? b_bias_or_none,"
       "Tensor! b_scales, Tensor? a_scales, Tensor? global_scale, Tensor? "

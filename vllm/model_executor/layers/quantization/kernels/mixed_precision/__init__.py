@@ -23,6 +23,9 @@ from vllm.model_executor.layers.quantization.kernels.mixed_precision.dynamic_4bi
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.exllama import (  # noqa: E501
     ExllamaLinearKernel,
 )
+from vllm.model_executor.layers.quantization.kernels.mixed_precision.gptq_cuda import (  # noqa: E501
+    GPTQCUDALinearKernel,
+)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.machete import (  # noqa: E501
     MacheteLinearKernel,
 )
@@ -50,6 +53,7 @@ _POSSIBLE_KERNELS: list[type[MPLinearKernel]] = [
     Dynamic4bitLinearKernel,
     BitBLASLinearKernel,
     ConchLinearKernel,
+    GPTQCUDALinearKernel,
     TritonLinearKernel,
     ExllamaLinearKernel,
     XPUwNa16LinearKernel,

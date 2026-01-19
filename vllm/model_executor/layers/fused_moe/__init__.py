@@ -83,6 +83,7 @@ if HAS_TRITON:
         BatchedTritonExperts,
     )
     from vllm.model_executor.layers.fused_moe.fused_moe import (
+        GPTQFusedExperts,
         TritonExperts,
         TritonWNA16Experts,
         fused_experts,
@@ -107,6 +108,7 @@ if HAS_TRITON:
         "CutlassExpertsFp8",
         "CutlassBatchedExpertsFp8",
         "CutlassExpertsW4A8Fp8",
+        "GPTQFusedExperts",
         "TritonExperts",
         "TritonWNA16Experts",
         "BatchedTritonExperts",

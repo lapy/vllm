@@ -1725,6 +1725,7 @@ class FusedMoE(CustomOp):
         has_separate_shared_experts = (
             not isinstance(self.quant_method, FusedMoEModularMethod)
             and self.shared_experts is not None
+            and not getattr(self.quant_method, "supports_shared_experts", False)
         )
 
         use_chunked_impl = self.use_dp_chunking

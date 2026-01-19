@@ -2171,6 +2171,79 @@ def moe_wna16_gemm(
     )
 
 
+def moe_w4a16_gptq_gemm(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    top_k: int,
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+    BLOCK_SIZE_K: int,
+    q_perm: torch.Tensor | None = None,
+    input_is_expanded: bool = False,
+    output_is_expanded: bool = False,
+    shared_qweight: torch.Tensor | None = None,
+    shared_scales: torch.Tensor | None = None,
+    shared_qzeros: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """GPTQ MoE GEMM kernel for Volta (SM70) and above.
+    
+    Performs a single GEMM operation using GPTQ 4-bit quantization.
+    This is used for both W1 (gate_up) and W2 (down) projections.
+    
+    Args:
+        q_perm: Optional permutation vector [K] mapping physical K index to logical K index.
+                Required when weights are shuffled via argsort(g_idx) to align input with weights.
+        input_is_expanded: Whether input is already expanded (M*topk) or collapsed (M).
+        output_is_expanded: Whether output is expanded (M*topk) or collapsed (M).
+        shared_qweight: Optional shared expert weights for fusion.
+        shared_scales: Optional shared expert scales.
+        shared_qzeros: Optional shared expert zero points.
+    """
+    if not current_platform.is_cuda():
+        raise NotImplementedError(
+            "The optimized moe_w4a16_gptq_gemm kernel is only available on CUDA platforms"
+        )
+
+    # Allocate a persistent work counter for the PTB kernel on the device
+    # Must be kept alive until the kernel is done. Attaching to output is a safe way.
+    work_counter = torch.zeros((1,), dtype=torch.int32, device=input.device)
+    
+    torch.ops._moe_C.moe_w4a16_gptq_gemm(
+        input,
+        output,
+        qweight,
+        scales,
+        qzeros,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        top_k,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        q_perm,
+        input_is_expanded,
+        output_is_expanded,
+        shared_qweight,
+        shared_scales,
+        shared_qzeros,
+        work_counter,
+    )
+    
+    # Keep alive mechanism
+    output._ptb_work_counter = work_counter 
+    
+    return output
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

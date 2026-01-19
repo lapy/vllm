@@ -5,15 +5,22 @@ from collections.abc import Callable
 
 import torch
 from compressed_tensors.quantization import ActivationOrdering
+from torch.nn.parameter import Parameter
 
+
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.gptq import ExllamaState
+import vllm.platforms as current_platform
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
 from vllm.model_executor.layers.quantization.kernels.mixed_precision import (
+    MPLinearKernel,
     MPLinearLayerConfig,
     choose_mp_linear_kernel,
 )
+
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.marlin import (
     MarlinLinearKernel,
 )
@@ -109,6 +116,8 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         )
 
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
+
+
 
         if kernel_type.__name__ not in self._kernel_backends_being_used:
             logger.info("Using %s for CompressedTensorsWNA16", kernel_type.__name__)
@@ -219,8 +228,6 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             w_gidx_param_name="weight_g_idx",
         )
 
-    # Checkpoints are serialized in compressed-tensors format, which is
-    # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
 
@@ -228,3 +235,5 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         return self.kernel.apply_weights(layer, x, bias)
+
+

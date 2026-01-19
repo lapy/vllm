@@ -39,6 +39,23 @@ torch::Tensor moe_wna16_gemm(torch::Tensor input, torch::Tensor output,
                              int64_t BLOCK_SIZE_M, int64_t BLOCK_SIZE_N,
                              int64_t BLOCK_SIZE_K, int64_t bit);
 
+torch::Tensor moe_w4a16_gptq_gemm(torch::Tensor input, torch::Tensor output,
+                            torch::Tensor qweight, torch::Tensor scales,
+                            torch::Tensor qzeros,
+                            std::optional<torch::Tensor> topk_weights,
+                            torch::Tensor sorted_token_ids,
+                            torch::Tensor expert_ids,
+                            torch::Tensor num_tokens_post_pad, int64_t top_k,
+                            int64_t BLOCK_SIZE_M, int64_t BLOCK_SIZE_N,
+                            int64_t BLOCK_SIZE_K,
+                            std::optional<torch::Tensor> q_perm,
+                            bool input_is_expanded,
+                            bool output_is_expanded,
+                            std::optional<torch::Tensor> shared_qweight,
+                            std::optional<torch::Tensor> shared_scales,
+                            std::optional<torch::Tensor> shared_qzeros,
+                            torch::Tensor global_work_counter);
+
 std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,

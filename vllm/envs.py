@@ -108,6 +108,9 @@ if TYPE_CHECKING:
     VLLM_USE_BYTECODE_HOOK: bool = False
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    VLLM_USE_GPTQ_FOR_COMPRESSED_TENSORS: bool = False
+
+    VLLM_USE_GPTQ_MOE_FUSED: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -931,6 +934,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
+
+
+    # If set, use the fused GPTQ MoE CUDA kernel (Volta+ only)
+    "VLLM_USE_GPTQ_MOE_FUSED": lambda: bool(
+        int(os.getenv("VLLM_USE_GPTQ_MOE_FUSED", "0"))
+    ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
