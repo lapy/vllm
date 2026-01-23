@@ -223,6 +223,16 @@ __global__ void moe_wna16_gemm_kernel(
 }
 
 template <typename scalar_t>
+void run_moe_wna16_gemm_sm70(
+    const scalar_t* input, scalar_t* output, const uint32_t* b_qweight,
+    const scalar_t* b_scales, const uint32_t* b_qzeros,
+    const float* topk_weights, const int32_t* sorted_token_ids,
+    const int32_t* expert_ids, const int32_t* num_tokens_post_pad,
+    int num_experts, int group_size, int num_token_blocks, int top_k,
+    int size_m, int size_n, int size_k, int BLOCK_SIZE_M, int BLOCK_SIZE_N,
+    int BLOCK_SIZE_K, int bit, bool has_zp, bool mul_topk_weight);
+
+template <typename scalar_t>
 void run_moe_wna16_gemm(const scalar_t* input, scalar_t* output,
                         const uint32_t* b_qweight, const scalar_t* b_scales,
                         const uint32_t* b_qzeros, const float* topk_weights,
@@ -310,20 +320,38 @@ torch::Tensor moe_wna16_gemm(torch::Tensor input, torch::Tensor output,
               "BLOCK_SIZE_K must divisible by group_size");
   TORCH_CHECK(BLOCK_SIZE_M <= 64, "BLOCK_SIZE_M must less or equal to 64");
   TORCH_CHECK(groups_per_block_row == 1 || groups_per_block_row == 2 ||
-                  groups_per_block_row == 4 || groups_per_block_row == 8,
-              "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8]");
+                  groups_per_block_row == 4 || groups_per_block_row == 8 ||
+                  groups_per_block_row == 16 || groups_per_block_row == 32,
+              "BLOCK_SIZE_K // group_size must be one of [1, 2, 4, 8, 16, 32]");
 
   if (input.scalar_type() == at::ScalarType::Half) {
-    run_moe_wna16_gemm<half>(
-        (const half*)input.data_ptr<at::Half>(),
-        (half*)output.data_ptr<at::Half>(),
-        (const uint32_t*)b_qweight.data_ptr<uint8_t>(),
-        (const half*)b_scales.data_ptr<at::Half>(), b_qzeros_ptr,
-        topk_weights_ptr, sorted_token_ids.data_ptr<int32_t>(),
-        expert_ids.data_ptr<int32_t>(), num_tokens_post_pad.data_ptr<int32_t>(),
-        num_experts, group_size, num_token_blocks, top_k, size_m, size_n,
-        size_k, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, bit,
-        b_qzeros.has_value(), topk_weights.has_value());
+    int dev_id = input.get_device();
+    if (at::cuda::getDeviceProperties(dev_id)->major == 7 &&
+        at::cuda::getDeviceProperties(dev_id)->minor == 0) {
+      run_moe_wna16_gemm_sm70<half>(
+          (const half*)input.data_ptr<at::Half>(),
+          (half*)output.data_ptr<at::Half>(),
+          (const uint32_t*)b_qweight.data_ptr<uint8_t>(),
+          (const half*)b_scales.data_ptr<at::Half>(), b_qzeros_ptr,
+          topk_weights_ptr, sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(),
+          num_tokens_post_pad.data_ptr<int32_t>(), num_experts, group_size,
+          num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
+          BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
+          topk_weights.has_value());
+    } else {
+      run_moe_wna16_gemm<half>(
+          (const half*)input.data_ptr<at::Half>(),
+          (half*)output.data_ptr<at::Half>(),
+          (const uint32_t*)b_qweight.data_ptr<uint8_t>(),
+          (const half*)b_scales.data_ptr<at::Half>(), b_qzeros_ptr,
+          topk_weights_ptr, sorted_token_ids.data_ptr<int32_t>(),
+          expert_ids.data_ptr<int32_t>(),
+          num_tokens_post_pad.data_ptr<int32_t>(), num_experts, group_size,
+          num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
+          BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
+          topk_weights.has_value());
+    }
   } else if (input.scalar_type() == at::ScalarType::BFloat16) {
     run_moe_wna16_gemm<nv_bfloat16>(
         (const nv_bfloat16*)input.data_ptr<at::BFloat16>(),

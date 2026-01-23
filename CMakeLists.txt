@@ -977,6 +977,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     CUDA_ARCHS "${CUDA_ARCHS}")
 
   list(APPEND VLLM_MOE_EXT_SRC "${VLLM_MOE_WNA16_SRC}")
+
+  # Only build sm70 kernel if 7.0 is in the target architectures
+  cuda_archs_loose_intersection(MOE_WNA16_SM70_ARCHS "7.0" "${CUDA_ARCHS}")
+  if(MOE_WNA16_SM70_ARCHS)
+    set(VLLM_MOE_WNA16_SM70_SRC "csrc/moe/moe_wna16_sm70.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_MOE_WNA16_SM70_SRC}"
+      CUDA_ARCHS "${MOE_WNA16_SM70_ARCHS}")
+    list(APPEND VLLM_MOE_EXT_SRC "${VLLM_MOE_WNA16_SM70_SRC}")
+  endif()
+  
   # moe marlin arches
   # note that we always set `use_atomic_add=False` for moe marlin now,
   # so we don't need 9.0 for bf16 atomicAdd PTX
