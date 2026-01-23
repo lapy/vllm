@@ -567,7 +567,7 @@ def apply_gptq_marlin_linear(
 
         reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
 
-    output = ops.gptq_marlin_gemm(
+    output = ops.marlin_gemm(
         reshaped_x,
         None,
         weight,
@@ -632,7 +632,7 @@ def apply_awq_marlin_linear(
         )
         reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
 
-    output = ops.gptq_marlin_gemm(
+    output = ops.marlin_gemm(
         reshaped_x,
         None,
         weight,
