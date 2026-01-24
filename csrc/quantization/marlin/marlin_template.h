@@ -36,7 +36,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 template <typename scalar_t,  // compute dtype, half or nv_float16
           const vllm::ScalarTypeId b_type_id,  // weight MarlinScalarType id
@@ -81,6 +81,24 @@ __global__ void Marlin(
 template <int count, vllm::ScalarTypeId type_id>
 __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  // SM70 (Volta) ldmatrix emulation using warp shuffles.
+  // The ldmatrix instruction is not available on SM70, so we emulate it
+  // by loading data and redistributing via warp shuffle to match the
+  // expected fragment layout for tensor core MMA operations.
+  uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
+  if constexpr (count == 4) {
+    ldmatrix_m8n8_x4_sm70(a, smem_ptr);
+  } else if constexpr (count == 2) {
+    ldmatrix_m8n8_x2_sm70(a, smem_ptr);
+  } else if constexpr (count == 1) {
+    ldmatrix_m8n8_x1_sm70(a, smem_ptr);
+  } else {
+    static_assert(count == 1 || count == 2 || count == 4, "invalid count");
+  }
+
+  #else
+  // SM75+ supports ldmatrix
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (count == 4) {
@@ -99,6 +117,7 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }
+  #endif
 }
 
 // Multiply dequantized values by the corresponding quantization scale; used
@@ -285,10 +304,16 @@ __global__ void Marlin(
   if constexpr (a_type_id == vllm::kFE4M3fn.id()) return;
   #endif
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-  // Turing TensorCore only supports fp16 and int8
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  // Turing TensorCore supports fp16 and int8. 
+  // Volta TensorCore only supports fp16.
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  if constexpr (a_type_id != vllm::kFloat16.id())
+    return;
+  #else
   if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id())
     return;
+  #endif
   #endif
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
@@ -710,8 +735,16 @@ __global__ void Marlin(
   // same shared memory banks. Further, it seems (based on NSight-Compute) that
   // each warp must also write a consecutive memory segment?
   auto transform_a = [&](int i) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    // SM70 ldmatrix emulation requires standard row-major layout without XOR.
+    // The XOR transform permutes column indices in a way that breaks the
+    // shuffle patterns in ldmatrix_m8n8_x*.
+    // This may cause some bank conflicts but ensures correct results.
+    return i;
+#else
     int row = i / a_gl_rd_delta_o;
     return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
+#endif
   };
   // Since the computation of this remapping is non-trivial and, due to our main
   // loop unrolls, all shared memory accesses are static, we simply precompute
@@ -1312,12 +1345,23 @@ __global__ void Marlin(
 
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
+        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        // SM70 doesn't support 8-bit activations (matmul_a8 path)
+        // This should not be called on SM70, but we provide a stub to allow compilation
+        // Results will be incorrect if this path is executed
+        // No-op: fragments are left unchanged
+        (void)frag_a;
+        (void)frag_b;
+        (void)frag_c;
+        (void)frag_c_tmp;
+        #else
         mma<a_type_id, false, 32>(
             frag_a[k2][i], frag_b[0],
             (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
         mma<a_type_id, false, 32>(
             frag_a[k2][i], frag_b[1],
             (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        #endif
       }
 
       if constexpr (group_blocks != -1) {
@@ -1802,8 +1846,16 @@ __global__ void Marlin(
         if constexpr (!is_a_8bit) {
           matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
         } else {
+          #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+          // SM70 doesn't support 8-bit activations with k_size=32
+          // matmul_a8 uses mma with k_size=32 which requires SM80+
+          // Stub: do nothing - results will be incorrect if this path is executed
+          // This should not be called on SM70, but we allow compilation
+          (void)k;
+          #else
           static_assert(group_blocks != 0 && group_blocks != 1);
           matmul_a8(k);
+          #endif
         }
       }
       slice_iters--;

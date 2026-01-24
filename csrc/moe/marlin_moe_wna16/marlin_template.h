@@ -36,7 +36,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 template <typename scalar_t,  // compute dtype, half or nv_float16
           const vllm::ScalarTypeId b_type_id,  // weight MarlinScalarType id
@@ -89,6 +89,24 @@ __global__ void Marlin(
 template <int count, vllm::ScalarTypeId type_id>
 __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  // SM70 (Volta) ldmatrix emulation using warp shuffles.
+  // The ldmatrix instruction is not available on SM70, so we emulate it
+  // by loading data and redistributing via warp shuffle to match the
+  // expected fragment layout for tensor core MMA operations.
+  uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
+  if constexpr (count == 4) {
+    ldmatrix_m8n8_x4_sm70(a, smem_ptr);
+  } else if constexpr (count == 2) {
+    ldmatrix_m8n8_x2_sm70(a, smem_ptr);
+  } else if constexpr (count == 1) {
+    ldmatrix_m8n8_x1_sm70(a, smem_ptr);
+  } else {
+    static_assert(count == 1 || count == 2 || count == 4, "invalid count");
+  }
+
+  #else
+  // SM75+ supports ldmatrix
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (count == 4) {
@@ -107,6 +125,7 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }
+  #endif
 }
 
 // Multiply dequantized values by the corresponding quantization scale; used
@@ -298,10 +317,16 @@ __global__ void Marlin(
   if constexpr (a_type_id == vllm::kFE4M3fn.id()) return;
   #endif
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-  // Turing TensorCore only supports fp16 and int8
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  // Turing TensorCore supports fp16 and int8. 
+  // Volta TensorCore only supports fp16.
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  if constexpr (a_type_id != vllm::kFloat16.id())
+    return;
+  #else
   if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id())
     return;
+  #endif
   #endif
 
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
@@ -480,7 +505,7 @@ __global__ void Marlin(
         }
       }
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
       if constexpr (moe_block_size >= 16)
         local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
@@ -1003,26 +1028,57 @@ __global__ void Marlin(
         }
       } else {
         if constexpr (group_blocks != -1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+          // SM70 fix: Use group-based indexing instead of stage-based
+          // With updated s_tb_groups, each group gets its own buffer slot
+          constexpr int divisor = div_ceil(group_blocks, thread_k_blocks);
+          int group_num = a_off / divisor;
+          int4* sh_s_stage = sh_s + s_sh_stride * group_num;
+
+          // Only fetch scales if this tile starts a new group
+          if (a_off % divisor == 0) {
+#else
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+#endif
             if (s_sh_wr_pred) {
               cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            // SM70: s_tb_groups is used for buffer allocation, not global stride
+            s_gl_rd += s_gl_rd_delta;
+#else
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
+#endif
           }
         }
 
         if constexpr (has_zp && group_blocks != -1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+          // SM70 fix: Use group-based indexing for zero-points
+          constexpr int divisor = div_ceil(group_blocks, thread_k_blocks);
+          int group_num = a_off / divisor;
+          int4* sh_zp_stage = sh_zp + zp_sh_stride * group_num;
+
+          // Only fetch zero points if this tile starts a new group
+          if (a_off % divisor == 0) {
+#else
           int4* sh_zp_stage = sh_zp + zp_sh_stage * pipe;
 
           // Only fetch zero points if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+#endif
             if (zp_sh_wr_pred) {
               cp_async4(&sh_zp_stage[zp_sh_wr], &zp_ptr[zp_gl_rd]);
             }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            // SM70: zp_tb_groups is used for buffer allocation, not global stride
+            zp_gl_rd += zp_gl_rd_delta;
+#else
             zp_gl_rd += zp_gl_rd_delta * zp_tb_groups;
+#endif
           }
         }
       }
@@ -1108,7 +1164,13 @@ __global__ void Marlin(
           constexpr int g = group_blocks / thread_k_blocks;
           if (pipe % g == 0) {
             if (k % b_sh_wr_iters == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+              // SM70 fix: Use group-based indexing for reading
+              int group_num = full_pipe / g;
+              int4* sh_s_stage = sh_s + s_sh_stride * group_num;
+#else
               int4* sh_s_stage = sh_s + s_sh_stage * (g * (pipe / g));
+#endif
               reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
             } else {
               reinterpret_cast<int4*>(&frag_s[1])[0] =
@@ -1231,7 +1293,13 @@ __global__ void Marlin(
       } else if constexpr (group_blocks >= thread_k_blocks) {
         constexpr int g = group_blocks / thread_k_blocks;
         if (pipe % g == 0 && k % b_sh_wr_iters == 0 || is_a_8bit) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+          // SM70 fix: Use group-based indexing for reading zero-points
+          int group_num = full_pipe / g;
+          int4* sh_zp_stage = sh_zp + zp_sh_stride * group_num;
+#else
           int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
+#endif
   #pragma unroll
           for (int i = 0; i < num_ints_per_thread; i++) {
             frag_qzp[k % 2][i] =
@@ -1265,7 +1333,13 @@ __global__ void Marlin(
         if constexpr (group_blocks >= thread_k_blocks) {
           constexpr int g = group_blocks / thread_k_blocks;
           if (pipe % g == 0 && k % b_sh_wr_iters == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+            // SM70 fix: Use group-based indexing for reading float zero-points
+            int group_num = full_pipe / g;
+            int4* sh_zp_stage = sh_zp + zp_sh_stride * group_num;
+#else
             int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
+#endif
             reinterpret_cast<int4*>(&frag_zpf[k % 2])[0] =
                 sh_zp_stage[zp_sh_rd];
           }
@@ -1444,12 +1518,23 @@ __global__ void Marlin(
 
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
+        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        // SM70 doesn't support 8-bit activations (matmul_a8 path)
+        // This should not be called on SM70, but we provide a stub to allow compilation
+        // Results will be incorrect if this path is executed
+        // No-op: fragments are left unchanged
+        (void)frag_a;
+        (void)frag_b;
+        (void)frag_c;
+        (void)frag_c_tmp;
+        #else
         mma<a_type_id, false, 32>(
             frag_a[k2][i], frag_b[0],
             (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
         mma<a_type_id, false, 32>(
             frag_a[k2][i], frag_b[1],
             (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        #endif
       }
 
       if constexpr (group_blocks != -1) {

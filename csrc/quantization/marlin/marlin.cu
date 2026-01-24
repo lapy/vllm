@@ -37,7 +37,7 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
                                     int const* __restrict__ perm_int_ptr,
@@ -57,7 +57,7 @@ torch::Tensor marlin_gemm(
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float) {
   TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "marlin_gemm(..) requires CUDA_ARCH >= 8.0");
+                              "marlin_gemm(..) requires CUDA_ARCH >= 7.0");
   return torch::empty({1, 1});
 }
 
@@ -131,7 +131,11 @@ thread_config_t small_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {128, 128, 256},
     {64, 128, 128},
-    {128, 64, 128}};
+    {128, 64, 128},
+    // SM70 kernels require smaller thread_k due to shared memory constraints
+    {16, 256, 128},
+    {16, 384, 128},
+    {16, 512, 128}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
@@ -139,7 +143,11 @@ thread_config_t large_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {64, 256, 256},
     {64, 128, 128},
-    {128, 64, 128}};
+    {128, 64, 128},
+    // SM70 kernels require smaller thread_k due to shared memory constraints
+    {16, 512, 256},
+    {16, 768, 256},
+    {16, 1024, 256}};
 
 typedef struct {
   int blocks_per_sm;
@@ -391,10 +399,16 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
-              "marlin kernel only support Turing or newer GPUs.");
+  int compute_capability = major_capability * 10 + minor_capability;
+  TORCH_CHECK(compute_capability >= 70,
+              "marlin kernel only support Volta (SM70) or newer GPUs.");
   int stages = 4;
-  if (major_capability == 7 && minor_capability == 5) {
+  if (major_capability == 7 && minor_capability == 0) {
+    // SM70 (Volta) support
+    stages = 2;
+    TORCH_CHECK(a_type == vllm::kFloat16,
+                "SM70 (Volta) only support FP16 activation.");
+  } else if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
     TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
                 "Turing only support FP16 or INT8 activation.");

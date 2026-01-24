@@ -67,7 +67,8 @@ where `scale_factor * multiplier` can be computed at weight loading.
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+
 // Lookup-table based 3-input logical operation; explicitly used for
 // dequantization as the compiler does not seem to automatically recognize it in
 // all cases.
@@ -144,6 +145,8 @@ __device__ inline void dequant<half2, vllm::kU4B8.id(), false>(int q,
 template <>
 __device__ inline void dequant<half2, vllm::kU4.id(), true>(int q,
                                                             half2* frag_b) {
+  // U4 with zero-point: delegate to kU4B8 which does raw bit extraction
+  // This works for all architectures including SM70
   dequant<half2, vllm::kU4B8.id(), true>(q, frag_b);
 }
 
@@ -253,6 +256,7 @@ template <>
 __device__ inline void dequant<half2, vllm::kU8.id(), true>(int q,
                                                             half2* frag_b) {
   dequant<half2, vllm::kU8B128.id(), true>(q, frag_b);
+  // Note: SM70 replication already done in the called function
 }
 
 template <>

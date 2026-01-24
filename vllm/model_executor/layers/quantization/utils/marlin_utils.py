@@ -51,7 +51,7 @@ def query_marlin_supported_quant_types(
             -1 if capability_tuple is None else capability_tuple.to_int()
         )
 
-    if device_capability < 75:
+    if device_capability < 70:
         return []
 
     # - has_zp is True: return quant_types that has zero points
@@ -73,7 +73,10 @@ def query_marlin_supported_quant_types(
         # GPTQ style, unsigned + symmetric bias
         res = [scalar_types.uint4b8, scalar_types.uint8b128]
         if include_fp_type:
-            res += [scalar_types.float8_e4m3fn, scalar_types.float4_e2m1f]
+            # FP8/FP4 require SM75+ (Turing) for m16n8k16.row.col.f32.e4m3.e4m3.f32
+            # SM70 only supports FP16 (half) via m8n8k4 emulation
+            if device_capability >= 75:
+                res += [scalar_types.float8_e4m3fn, scalar_types.float4_e2m1f]
         return res
 
 
@@ -231,7 +234,7 @@ def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
         return False
     # Marlin requires compute capability >= 7.5 (Turing)
     capability_tuple = current_platform.get_device_capability()
-    if capability_tuple is None or capability_tuple.to_int() < 75:
+    if capability_tuple is None or capability_tuple.to_int() < 70:
         return False
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
