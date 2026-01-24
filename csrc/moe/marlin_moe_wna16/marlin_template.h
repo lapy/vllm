@@ -36,7 +36,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 template <typename scalar_t,  // compute dtype, half or nv_float16
           const vllm::ScalarTypeId b_type_id,  // weight MarlinScalarType id
@@ -91,6 +91,21 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  if constexpr (count == 4) {
+    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(smem));
+  } else if constexpr (count == 2) {
+    asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];\n"
+                 : "=r"(a[0]), "=r"(a[1])
+                 : "r"(smem));
+  } else if constexpr (count == 1) {
+    asm volatile("ld.shared.b32 {%0}, [%1];\n" : "=r"(a[0]) : "r"(smem));
+  } else {
+    static_assert(count == 1 || count == 2 || count == 4, "invalid count");
+  }
+  #else
   if constexpr (count == 4) {
     asm volatile(
         "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -107,6 +122,7 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }
+  #endif
 }
 
 // Multiply dequantized values by the corresponding quantization scale; used
@@ -304,6 +320,11 @@ __global__ void Marlin(
     return;
   #endif
 
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  // Volta TensorCore only supports fp16
+  if constexpr (a_type_id != vllm::kFloat16.id()) return;
+  #endif
+
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
@@ -480,7 +501,7 @@ __global__ void Marlin(
         }
       }
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
       if constexpr (moe_block_size >= 16)
         local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);

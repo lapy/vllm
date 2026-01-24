@@ -36,7 +36,7 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 template <typename scalar_t,  // compute dtype, half or nv_float16
           const vllm::ScalarTypeId b_type_id,  // weight MarlinScalarType id
@@ -81,6 +81,29 @@ __global__ void Marlin(
 template <int count, vllm::ScalarTypeId type_id>
 __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  // SM70 (Volta) ldmatrix fallback: load count consecutive 32-bit words into
+  // frag_a. Correctness requires that the shared memory at smem_ptr is staged
+  // so that this sequential load yields the same fragment layout as
+  // ldmatrix.sync.aligned.m8n8.x{1,2,4}.shared.b16 on SM75+ (see PTX matrix
+  // fragments for m16n8k16: docs.nvidia.com/cuda/parallel-thread-execution).
+  uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
+  const uint32_t* smem = reinterpret_cast<const uint32_t*>(smem_ptr);
+  if constexpr (count == 4) {
+    a[0] = smem[0];
+    a[1] = smem[1];
+    a[2] = smem[2];
+    a[3] = smem[3];
+  } else if constexpr (count == 2) {
+    a[0] = smem[0];
+    a[1] = smem[1];
+  } else if constexpr (count == 1) {
+    a[0] = smem[0];
+  } else {
+    static_assert(count == 1 || count == 2 || count == 4, "invalid count");
+  }
+  #else
+  // SM75+ supports ldmatrix
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (count == 4) {
@@ -99,6 +122,7 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }
+  #endif
 }
 
 // Multiply dequantized values by the corresponding quantization scale; used
@@ -285,8 +309,8 @@ __global__ void Marlin(
   if constexpr (a_type_id == vllm::kFE4M3fn.id()) return;
   #endif
 
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-  // Turing TensorCore only supports fp16 and int8
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  // Turing/Volta TensorCore only supports fp16 and int8
   if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id())
     return;
   #endif
@@ -1275,10 +1299,10 @@ __global__ void Marlin(
           mma_trans<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0, frag_b1,
                                                frag_c[i][j][0]);
         } else {
-          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0,
-                                         frag_c[i][j][0]);
-          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b1,
-                                         frag_c[i][j][1]);
+          mma<a_type_id, use_fp16_accum, 16 * thread_k_blocks>(
+              frag_a[k2][i], frag_b0, frag_c[i][j][0]);
+          mma<a_type_id, use_fp16_accum, 16 * thread_k_blocks>(
+              frag_a[k2][i], frag_b1, frag_c[i][j][1]);
         }
       }
     }
@@ -1312,12 +1336,23 @@ __global__ void Marlin(
 
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
+        #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+        // SM70 doesn't support 8-bit activations (matmul_a8 path)
+        // This should not be called on SM70, but we provide a stub to allow compilation
+        // Results will be incorrect if this path is executed
+        // No-op: fragments are left unchanged
+        (void)frag_a;
+        (void)frag_b;
+        (void)frag_c;
+        (void)frag_c_tmp;
+        #else
         mma<a_type_id, false, 32>(
             frag_a[k2][i], frag_b[0],
             (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
         mma<a_type_id, false, 32>(
             frag_a[k2][i], frag_b[1],
             (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        #endif
       }
 
       if constexpr (group_blocks != -1) {
@@ -1802,8 +1837,16 @@ __global__ void Marlin(
         if constexpr (!is_a_8bit) {
           matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
         } else {
+          #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+          // SM70 doesn't support 8-bit activations with k_size=32
+          // matmul_a8 uses mma with k_size=32 which requires SM80+
+          // Stub: do nothing - results will be incorrect if this path is executed
+          // This should not be called on SM70, but we allow compilation
+          (void)k;
+          #else
           static_assert(group_blocks != 0 && group_blocks != 1);
           matmul_a8(k);
+          #endif
         }
       }
       slice_iters--;

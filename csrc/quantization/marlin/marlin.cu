@@ -37,7 +37,7 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
 
 __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
                                     int const* __restrict__ perm_int_ptr,
@@ -57,7 +57,7 @@ torch::Tensor marlin_gemm(
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float) {
   TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "marlin_gemm(..) requires CUDA_ARCH >= 8.0");
+                              "marlin_gemm(..) requires CUDA_ARCH >= 7.0");
   return torch::empty({1, 1});
 }
 
@@ -131,7 +131,12 @@ thread_config_t small_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {128, 128, 256},
     {64, 128, 128},
-    {128, 64, 128}};
+    {128, 64, 128},
+    // SM70 (Volta): thread_k=16 or 32; thread_n>=2*threads for b_sh_wr_iters>=1
+    {16, 256, 128},
+    {16, 384, 128},
+    {16, 512, 128},
+};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
@@ -139,7 +144,12 @@ thread_config_t large_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {64, 256, 256},
     {64, 128, 128},
-    {128, 64, 128}};
+    {128, 64, 128},
+    // SM70 (Volta): thread_k=16 or 32; thread_n>=2*threads for b_sh_wr_iters>=1
+    {16, 512, 256},
+    {16, 768, 256},
+    {16, 1024, 256},
+};
 
 typedef struct {
   int blocks_per_sm;
@@ -232,7 +242,21 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
   }
 
   // Verify min for thread K/N
-  if (th_config.thread_n < min_thread_n || th_config.thread_k < min_thread_k) {
+  // SM70 (Volta) allows thread_k = 16 or 32 (min_thread_k is normally 64)
+  int effective_min_thread_k = min_thread_k;
+  int major_capability_check = 0;
+  int minor_capability_check = 0;
+  int current_device_check = 0;
+  cudaGetDevice(&current_device_check);
+  cudaError_t err_major_check = cudaDeviceGetAttribute(&major_capability_check, cudaDevAttrComputeCapabilityMajor, current_device_check);
+  cudaError_t err_minor_check = cudaDeviceGetAttribute(&minor_capability_check, cudaDevAttrComputeCapabilityMinor, current_device_check);
+  if (err_major_check == cudaSuccess && err_minor_check == cudaSuccess) {
+    int compute_capability_check = major_capability_check * 10 + minor_capability_check;
+    if (compute_capability_check == 70) {
+      effective_min_thread_k = 16;  // SM70 supports thread_k = 16 or 32
+    }
+  }
+  if (th_config.thread_n < min_thread_n || th_config.thread_k < effective_min_thread_k) {
     return false;
   }
 
@@ -240,6 +264,7 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
   if (th_config.num_threads < 128) {
     return false;
   }
+
 
   // Check that pipeline fits into cache
   int cache_size = get_kernel_cache_size(
@@ -278,8 +303,26 @@ exec_config_t determine_exec_config(
           ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
           : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
 
+  // Check if we're on SM70 - if so, only consider configs with thread_k = 16 or 32
+  bool is_sm70 = false;
+  int current_device = 0;
+  cudaGetDevice(&current_device);
+  int major_capability = 0;
+  int minor_capability = 0;
+  cudaError_t err_major = cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor, current_device);
+  cudaError_t err_minor = cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor, current_device);
+  if (err_major == cudaSuccess && err_minor == cudaSuccess) {
+    int compute_capability = major_capability * 10 + minor_capability;
+    is_sm70 = (compute_capability == 70);
+  }
+
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
+
+    // For SM70, only allow thread_k = 16 or 32 (k_size=16 or k_size=32)
+    if (is_sm70 && th_config.thread_k != 16 && th_config.thread_k != 32) {
+      continue;
+    }
 
     if (!is_valid_config(th_config, thread_m_blocks, prob_m, prob_n, prob_k,
                          num_bits, group_size, has_act_order, is_k_full, has_zp,
@@ -391,10 +434,16 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
-              "marlin kernel only support Turing or newer GPUs.");
+  int compute_capability = major_capability * 10 + minor_capability;
+  TORCH_CHECK(compute_capability >= 70,
+              "marlin kernel only support Volta (SM70) or newer GPUs.");
   int stages = 4;
-  if (major_capability == 7 && minor_capability == 5) {
+  if (major_capability == 7 && minor_capability == 0) {
+    // SM70 (Volta) support
+    stages = 2;
+    TORCH_CHECK(a_type == vllm::kFloat16,
+                "SM70 (Volta) only support FP16 activation.");
+  } else if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
     TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
                 "Turing only support FP16 or INT8 activation.");

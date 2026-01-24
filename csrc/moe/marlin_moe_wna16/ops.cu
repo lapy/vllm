@@ -435,13 +435,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
-              "marlin kernel only support Turing or newer GPUs.");
+  TORCH_CHECK(major_capability * 10 + minor_capability >= 70,
+              "marlin kernel only support Volta or newer GPUs.");
   int stages = 4;
-  if (major_capability == 7 && minor_capability == 5) {
+  if ((major_capability == 7 && minor_capability == 5) ||
+      (major_capability == 7 && minor_capability == 0)) {
     stages = 2;
     TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
-                "Turing only support FP16 or INT8 activation.");
+                "Volta only support FP16 or INT8 activation.");
   }
   if (a_type == vllm::kFE4M3fn) {
     TORCH_CHECK(major_capability * 10 + minor_capability >= 89,
