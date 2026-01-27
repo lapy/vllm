@@ -67,24 +67,25 @@ __device__ __forceinline__ void ldmatrix_m8n8_x1_sm70(
     
     // Each row has 8 half values = 4 uint32_t
     // Thread t (where t < 8) provides address for row t
-    // Load the full row locally
+    
+    // For x1, we load 1 register per thread from the pointer provided by THIS thread.
+    // Marlin ensures each thread's pointer is offset correctly.
     const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(smem_ptr);
+    uint32_t my_word = row_ptr[0]; // Load only 4 bytes
     
-    // For x1, we load 1 register per thread
-    // Distribution: lane % 8 gives source row, lane / 8 gives which word
+    // Distribution: lane % 8 gives source row
+    // Each group of 8 threads needs data from the corresponding group of 8 threads.
+    // 0-7 get from 0-7. 8-15 get from 8-15 (who loaded the next column chunk).
+    
     int source_row = lane % 8;
-    int word_idx = (lane / 8) % 4;
+    // Calculate source lane: which 8-thread group are we in?
+    int warp_group_offset = (lane / 8) * 8;
+    int src_lane = warp_group_offset + source_row;
     
-    // Load all 4 words of our row
-    uint32_t my_words[4];
-    my_words[0] = row_ptr[0];
-    my_words[1] = row_ptr[1];
-    my_words[2] = row_ptr[2];
-    my_words[3] = row_ptr[3];
-    
-    // Shuffle to get the correct word from the correct source lane
-    uint32_t val = __shfl_sync(FULL_MASK, my_words[word_idx], source_row);
-    dst[0] = val;
+    // Shuffle to get the word from the correct source lane
+    // Since each thread loaded the word it 'owns' logic-wise (via offset pointer),
+    // and we just need to distribute rows within the 8x8 block logic:
+    dst[0] = __shfl_sync(FULL_MASK, my_word, src_lane);
 }
 
 // Emulates ldmatrix.sync.aligned.m8n8.x2.shared.b16
@@ -97,25 +98,28 @@ __device__ __forceinline__ void ldmatrix_m8n8_x2_sm70(
     
     const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(smem_ptr);
     
-    // Load our row's 4 words
-    uint32_t my_words[4];
+    // For x2, each thread gets 2 registers
+    // We load 2 words (8 bytes) from our pointer
+    uint32_t my_words[2];
     my_words[0] = row_ptr[0];
     my_words[1] = row_ptr[1];
-    my_words[2] = row_ptr[2];
-    my_words[3] = row_ptr[3];
     
-    // For x2, each thread gets 2 registers
     // Layout matches mma.m16n8k16 operand A fragment
     // Lanes 0-7: rows 0-7, lanes 8-15: rows 0-7 (different columns)
     // Lanes 16-23: rows 8-15, lanes 24-31: rows 8-15 (different columns)
     
-    int row_in_tile = lane % 8;
-    int col_group = (lane / 8) % 2;  // 0 or 1 for column selection
+    // src_lane logic:
+    // 0-7: Src 0-7.
+    // 8-15: Src 8-15 (They loaded the next column chunk).
     
-    // dst[0]: columns 0-1 or 2-3 based on col_group
-    // dst[1]: columns 4-5 or 6-7 based on col_group
-    uint32_t v0 = __shfl_sync(FULL_MASK, my_words[col_group * 2 + 0], row_in_tile);
-    uint32_t v1 = __shfl_sync(FULL_MASK, my_words[col_group * 2 + 1], row_in_tile);
+    int row_in_tile = lane % 8;
+    int warp_group_offset = (lane / 8) * 8;
+    int src_lane = warp_group_offset + row_in_tile;
+
+    // We don't need 'col_group' offset logic for indices anymore because
+    // my_words[0] IS the correct data for this group (since pointer was offset).
+    uint32_t v0 = __shfl_sync(FULL_MASK, my_words[0], src_lane);
+    uint32_t v1 = __shfl_sync(FULL_MASK, my_words[1], src_lane);
     
     dst[0] = v0;
     dst[1] = v1;

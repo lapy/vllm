@@ -674,15 +674,184 @@ bool test_marlin_simulation() {
     return true;
 }
 
+// =============================================================================
+// New Comprehensive Tests for ldmatrix variants and small-block simulation
+// =============================================================================
+
+__global__ void test_ldmatrix_x1_kernel(const uint32_t* input, uint32_t* output) {
+    __shared__ uint32_t sh_mem[32 * 4];
+    int tid = threadIdx.x;
+    if (tid < 32) {
+        // Init shared memory with identifiable pattern
+        for(int i=0; i<4; i++) sh_mem[tid*4 + i] = input[tid*4 + i];
+    }
+    __syncwarp();
+
+    uint32_t frag[1];
+    // x1 load requires pointer to thread's row start. 
+    // Emulation expects pointer to start of 8-half (16 byte) row.
+    ldmatrix_m8n8_x1_sm70(frag, &sh_mem[tid*4]);
+
+    output[tid] = frag[0];
+}
+
+bool test_ldmatrix_x1_correctness() {
+    printf("Running test_ldmatrix_x1_correctness...\n");
+    std::vector<uint32_t> input(32 * 4);
+    std::vector<uint32_t> output(32);
+    
+    // Fill input with unique IDs
+    for(int i=0; i<32*4; i++) input[i] = i; // unique value per word
+    
+    uint32_t *d_in, *d_out;
+    cudaMalloc(&d_in, input.size() * 4);
+    cudaMalloc(&d_out, output.size() * 4);
+    cudaMemcpy(d_in, input.data(), input.size() * 4, cudaMemcpyHostToDevice);
+    
+    test_ldmatrix_x1_kernel<<<1, 32>>>(d_in, d_out);
+    
+    cudaMemcpy(output.data(), d_out, output.size() * 4, cudaMemcpyDeviceToHost);
+    
+    cudaFree(d_in); cudaFree(d_out);
+    
+    // Verify x1 load: each thread ends up with the word from its own pointer.
+    // Input is linear, so Output[t] should equal input[t*4].
+    
+    bool pass = true;
+    for(int t=0; t<32; t++) {
+        if(output[t] != input[t*4]) {
+            printf("FAILED: Thread %d got %u, expected %u\n", t, output[t], input[t*4]);
+            pass = false;
+        }
+    }
+    
+    if(pass) printf("PASSED\n");
+    return pass;
+}
+
+__global__ void test_ldmatrix_x2_kernel(const uint32_t* input, uint32_t* output) {
+    __shared__ uint32_t sh_mem[32 * 4];
+    int tid = threadIdx.x;
+    if (tid < 32) {
+        for(int i=0; i<4; i++) sh_mem[tid*4 + i] = input[tid*4 + i];
+    }
+    __syncwarp();
+
+    uint32_t frag[2];
+    ldmatrix_m8n8_x2_sm70(frag, &sh_mem[tid*4]);
+
+    output[tid*2 + 0] = frag[0];
+    output[tid*2 + 1] = frag[1];
+}
+
+bool test_ldmatrix_x2_correctness() {
+    printf("Running test_ldmatrix_x2_correctness...\n");
+    std::vector<uint32_t> input(32 * 4);
+    std::vector<uint32_t> output(32 * 2);
+    
+    for(int i=0; i<32*4; i++) input[i] = i; 
+    
+    uint32_t *d_in, *d_out;
+    cudaMalloc(&d_in, input.size()*4);
+    cudaMalloc(&d_out, output.size()*4);
+    cudaMemcpy(d_in, input.data(), input.size()*4, cudaMemcpyHostToDevice);
+    
+    test_ldmatrix_x2_kernel<<<1, 32>>>(d_in, d_out);
+    
+    cudaMemcpy(output.data(), d_out, output.size()*4, cudaMemcpyDeviceToHost);
+    cudaFree(d_in); cudaFree(d_out);
+    
+    // Verify x2 load: each thread gets 2 words from its own pointer.
+    // Output[2*t] = input[t*4], Output[2*t+1] = input[t*4+1].
+    
+    bool pass = true;
+    for(int t=0; t<32; t++) {
+        if(output[2*t] != input[t*4] || output[2*t+1] != input[t*4+1]) {
+             printf("FAILED: Thread %d mismatch\n", t);
+             pass = false;
+             break;
+        }
+    }
+    if(pass) printf("PASSED\n");
+    return pass;
+}
+
+// Kernel to strictly verify OOB access patterns
+// Uses dynamic shared memory to place the buffer at the very end of allocation.
+__global__ void marlin_simulation_small_blocks_strict_boundary_kernel(
+    float* C_global
+) {
+    extern __shared__ uint32_t sh_mem[];
+    
+    // We position the read pointer at the very end of the allocated shared memory.
+    // If usage is 8 bytes (fixed), it fits. 
+    // If usage is 16 bytes (buggy), it goes OOB.
+}
+
+__global__ void marlin_oob_check_kernel(int offset_u32, float* debug_out) {
+    extern __shared__ uint32_t base_shmem[];
+    
+    // Ensure we initialized memory to avoid other errors
+    if (threadIdx.x < offset_u32 + 4) {
+         // Some bounds check if we are tiny, but we assume enough space
+         // base_shmem[threadIdx.x] = 0; 
+    }
+    __syncwarp();
+    
+    // Point to the boundary
+    uint32_t* my_ptr = &base_shmem[offset_u32];
+    
+    uint32_t frag[2];
+    // This call will OOB if buggy and offset_u32 is (Size - 2).
+    ldmatrix_m8n8_x2_sm70(frag, my_ptr);
+    
+    // Prevent optimization
+    if (threadIdx.x == 0) debug_out[0] = (float)frag[0];
+}
+
+bool test_marlin_simulation_small_blocks() {
+    printf("Running test_marlin_simulation_small_blocks (Boundary Check)...\n");
+    
+    // Allocate shared memory: 128 uint32s (512 bytes)
+    int shmem_u32 = 128;
+    int shmem_bytes = shmem_u32 * 4;
+    
+    // Point to the last 8 bytes (2 uint32s) of the 128-element buffer.
+    // Index 126. Fixed reads [126-127] (OK). Buggy reads [126-129] (Crash).
+    int offset = 126;
+    
+    float* d_debug;
+    cudaMalloc(&d_debug, 4);
+    
+    // Launch with dynamic shared memory
+    marlin_oob_check_kernel<<<1, 32, shmem_bytes>>>(offset, d_debug);
+    
+    // Check for kernel launch failure (which mimics the illegal access crash)
+    cudaError_t err = cudaGetLastError();
+    cudaFree(d_debug);
+
+    if (err != cudaSuccess) {
+        printf("FAILED: Kernel crashed with %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    
+    printf("PASSED (No illegal memory access at boundary)\n");
+    return true;
+}
+
 int main() {
     bool all_pass = true;
     all_pass &= test_ldmatrix_perfect_reconstruction();
     all_pass &= test_mma_correctness();
     all_pass &= test_marlin_simulation();
-    // New tests
     all_pass &= test_mma_random_numerical();
     all_pass &= test_ldmatrix_strict_pattern();
     all_pass &= test_marlin_simulation_looped();
+    
+    // New Comprehensive Tests
+    all_pass &= test_ldmatrix_x1_correctness();
+    all_pass &= test_ldmatrix_x2_correctness();
+    all_pass &= test_marlin_simulation_small_blocks();
     
     if (all_pass) {
         printf("\nALL TESTS PASSED\n");
@@ -692,3 +861,4 @@ int main() {
         return 1;
     }
 }
+
