@@ -179,7 +179,7 @@ __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70(
     // Bottom half (dst[2], dst[3]) comes from rows 8-15
     
     int src_row_top = row_in_group;  // lanes 0-7 have rows 0-7
-    int src_row_bot = row_in_group + 8;  // lanes 8-15 have rows 8-15
+    int src_row_bot = row_in_group + 16;  // lanes 16-23 have rows 8-15
     
     // Word selection based on column grouping
     // col_pair=0: words 0,1  col_pair=1: words 2,3
@@ -215,6 +215,13 @@ __device__ void mma_m8n8k4_sm70(
     // This works when fragments are pre-distributed correctly
     uint32_t a_val = *reinterpret_cast<const uint32_t*>(&a);
     uint32_t b_val = *reinterpret_cast<const uint32_t*>(&b);
+    
+    // PTX mma.m8n8k4.f32 requires 8 accumulator registers ({%0..%7}).
+    // However, for the m16n8k16 composition pattern used in Marlin,
+    // only a subset of these outputs contains the accumulated sums we care about
+    // (mapped to the specific C elements). The others are mathematically redundant
+    // or unused in this specific mapping. We bind all 8 to satisfy the ISA, 
+    // but only extract the first 4.
     float c_ext[8] = {c0, c1, c2, c3, 0.0f, 0.0f, 0.0f, 0.0f};
 
     asm volatile(
