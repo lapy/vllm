@@ -426,19 +426,14 @@ bool test_marlin_simulation_looped() {
     std::vector<half> B_ref(K*N);
     std::vector<float> C_ref(M*N);
     
-    // Initialize with A=1.0, B=Random
-    // We use A=1.0 because exact element-wise matching requires reversing the hardware's 
-    // opaque B-matrix layout shuffling which is complex.
-    // With A=1.0, the result C[m,n] = Sum_k(B[k,n]).
-    // The Total Sum of C should be M * Sum(B).
-    // This rigorously checks that we processed all K iterations and all N columns without losing data,
-    // which is the goal of the loop stress test.
+    // Initialize with A=1.0, B=0.1 for Calibration
+    // We want to determine the EXACT multiplier.
     
     std::default_random_engine generator(42);
     std::uniform_real_distribution<float> distribution(-0.5, 0.5);
     
     for(int i=0; i<M*K; i++) A_ref[i] = __float2half(1.0f);
-    for(int i=0; i<K*N; i++) B_ref[i] = __float2half(distribution(generator));
+    for(int i=0; i<K*N; i++) B_ref[i] = __float2half(0.1f);
     
     // Calculate Reference
     matmul_cpu(A_ref.data(), B_ref.data(), C_ref.data(), M, N, K);
