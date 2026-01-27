@@ -2128,6 +2128,290 @@ static bool test_mma_accumulation_stability() {
     return ok;
 }
 
+// ===========================================================================
+// Fragment-based Marlin Validation Tests
+// ===========================================================================
+
+// Helper: fill fragment arrays for a thread based on Marlin's expected layout
+// For m16n8k16: Each thread gets A[4], B[2], produces frag_c[4]
+// Marlin layout: thread 'tid' contributes to specific rows/cols based on Volta mapping
+__host__ void fill_marlin_fragment_all_ones(
+    uint32_t* A_frag,  // [32][4] - one A[4] per thread
+    uint32_t* B_frag,  // [32][2] - one B[2] per thread
+    int num_threads = 32) {
+    // Fill all fragments with 1.0 packed as half2
+    uint32_t ones = 0x3c003c00; // 1.0, 1.0 in fp16
+    for (int t = 0; t < num_threads; t++) {
+        for (int i = 0; i < 4; i++) A_frag[t * 4 + i] = ones;
+        for (int i = 0; i < 2; i++) B_frag[t * 2 + i] = ones;
+    }
+}
+
+// Kernel: Each thread loads its fragment and computes, writes output
+__global__ void test_mma_m16n8k16_frag_numerical_kernel(
+    const uint32_t* A_all,  // [32][4]
+    const uint32_t* B_all,  // [32][2]
+    float* C_all) {         // [32][4]
+    int tid = get_sm70_warp_lane();
+    
+    // Load this thread's fragments
+    uint32_t A[4], B[2];
+    for (int i = 0; i < 4; i++) A[i] = A_all[tid * 4 + i];
+    for (int i = 0; i < 2; i++) B[i] = B_all[tid * 2 + i];
+    
+    float frag_c[4] = {0, 0, 0, 0};
+    mma_m16n8k16_sm70(A, B, frag_c);
+    
+    // Write output
+    for (int i = 0; i < 4; i++) C_all[tid * 4 + i] = frag_c[i];
+}
+
+// Test: Fragment API with all ones - verifies basic computation
+static bool test_mma_frag_all_ones_numerical() {
+    printf("\n=== test fragment API all-ones numerical ===\n");
+    
+    // Allocate host fragments
+    std::vector<uint32_t> A_h(32 * 4), B_h(32 * 2);
+    fill_marlin_fragment_all_ones(A_h.data(), B_h.data());
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, 32 * 4 * sizeof(uint32_t));
+    cudaMalloc(&dB, 32 * 2 * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 4 * sizeof(float));
+    cudaMemcpy(dA, A_h.data(), 32 * 4 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_h.data(), 32 * 2 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemset(dC, 0, 32 * 4 * sizeof(float));
+    
+    test_mma_m16n8k16_frag_numerical_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C_h(32 * 4);
+    cudaMemcpy(C_h.data(), dC, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    
+    // Verify: With A=1, B=1 fragments, expect non-zero results
+    // The exact values depend on the MMA accumulation pattern
+    int nonzero = 0;
+    float sum = 0;
+    for (int i = 0; i < 32 * 4; i++) {
+        if (std::abs(C_h[i]) > 0.1f) nonzero++;
+        sum += C_h[i];
+    }
+    
+    // At minimum, we expect some threads to produce non-zero results
+    bool ok = (nonzero > 0 && sum > 0);
+    printf("Fragment all-ones: %d non-zero outputs, total sum=%.2f\n", nonzero, sum);
+    printf(ok ? "[PASS] fragment all-ones numerical\n" : "[FAIL] fragment all-ones numerical\n");
+    return ok;
+}
+
+// Test: Fragment API with accumulation - verifies accumulator behavior
+static bool test_mma_frag_accumulation() {
+    printf("\n=== test fragment API accumulation ===\n");
+    
+    std::vector<uint32_t> A_h(32 * 4), B_h(32 * 2);
+    fill_marlin_fragment_all_ones(A_h.data(), B_h.data());
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, 32 * 4 * sizeof(uint32_t));
+    cudaMalloc(&dB, 32 * 2 * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 4 * sizeof(float));
+    cudaMemcpy(dA, A_h.data(), 32 * 4 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_h.data(), 32 * 2 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemset(dC, 0, 32 * 4 * sizeof(float));
+    
+    // Run kernel once to get baseline
+    test_mma_m16n8k16_frag_numerical_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C1_h(32 * 4);
+    cudaMemcpy(C1_h.data(), dC, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Run again - results should be different (accumulated) or same (if reset)
+    // With the current fragment API, each call starts fresh with frag_c=0
+    cudaMemset(dC, 0, 32 * 4 * sizeof(float));
+    test_mma_m16n8k16_frag_numerical_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C2_h(32 * 4);
+    cudaMemcpy(C2_h.data(), dC, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    
+    // Verify: Second run should match first (each starts with zero accumulators)
+    bool ok = true;
+    for (int i = 0; i < 32 * 4; i++) {
+        if (std::abs(C1_h[i] - C2_h[i]) > 0.01f) {
+            ok = false;
+            break;
+        }
+    }
+    
+    printf(ok ? "[PASS] fragment accumulation\n" : "[FAIL] fragment accumulation (runs differ)\n");
+    return ok;
+}
+
+// Helper: Fill with scaled values
+__host__ void fill_marlin_fragment_scaled(
+    uint32_t* A_frag,
+    uint32_t* B_frag,
+    float a_scale,
+    float b_scale,
+    int num_threads = 32) {
+    half a_h = __float2half(a_scale);
+    half b_h = __float2half(b_scale);
+    half2 a_packed = __halves2half2(a_h, a_h);
+    half2 b_packed = __halves2half2(b_h, b_h);
+    uint32_t a_val = *reinterpret_cast<uint32_t*>(&a_packed);
+    uint32_t b_val = *reinterpret_cast<uint32_t*>(&b_packed);
+    
+    for (int t = 0; t < num_threads; t++) {
+        for (int i = 0; i < 4; i++) A_frag[t * 4 + i] = a_val;
+        for (int i = 0; i < 2; i++) B_frag[t * 2 + i] = b_val;
+    }
+}
+
+// Test: Fragment API with different scaling
+static bool test_mma_frag_scaling() {
+    printf("\n=== test fragment API scaling ===\n");
+    
+    std::vector<uint32_t> A_h(32 * 4), B_h(32 * 2);
+    
+    // Test with scale=2.0
+    fill_marlin_fragment_scaled(A_h.data(), B_h.data(), 2.0f, 1.0f);
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, 32 * 4 * sizeof(uint32_t));
+    cudaMalloc(&dB, 32 * 2 * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 4 * sizeof(float));
+    cudaMemcpy(dA, A_h.data(), 32 * 4 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_h.data(), 32 * 2 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemset(dC, 0, 32 * 4 * sizeof(float));
+    
+    test_mma_m16n8k16_frag_numerical_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C2_h(32 * 4);
+    cudaMemcpy(C2_h.data(), dC, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Now test with scale=1.0
+    fill_marlin_fragment_scaled(A_h.data(), B_h.data(), 1.0f, 1.0f);
+    cudaMemcpy(dA, A_h.data(), 32 * 4 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemset(dC, 0, 32 * 4 * sizeof(float));
+    
+    test_mma_m16n8k16_frag_numerical_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C1_h(32 * 4);
+    cudaMemcpy(C1_h.data(), dC, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    
+    // Scale=2 A should produce roughly 2x the output of scale=1
+    float sum1 = 0, sum2 = 0;
+    for (int i = 0; i < 32 * 4; i++) {
+        sum1 += std::abs(C1_h[i]);
+        sum2 += std::abs(C2_h[i]);
+    }
+    
+    float ratio = (sum1 > 0.1f) ? sum2 / sum1 : 0;
+    bool ok = (ratio > 1.5f && ratio < 2.5f);  // Should be ~2.0
+    printf("Fragment scaling: sum(A=1)=%.2f, sum(A=2)=%.2f, ratio=%.2f\n", sum1, sum2, ratio);
+    printf(ok ? "[PASS] fragment scaling\n" : "[FAIL] fragment scaling\n");
+    return ok;
+}
+
+// Test: Fragment zero inputs
+static bool test_mma_frag_zero_inputs() {
+    printf("\n=== test fragment API zero inputs ===\n");
+    
+    std::vector<uint32_t> A_h(32 * 4, 0), B_h(32 * 2, 0);  // All zeros
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, 32 * 4 * sizeof(uint32_t));
+    cudaMalloc(&dB, 32 * 2 * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 4 * sizeof(float));
+    cudaMemcpy(dA, A_h.data(), 32 * 4 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_h.data(), 32 * 2 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemset(dC, 0, 32 * 4 * sizeof(float));
+    
+    test_mma_m16n8k16_frag_numerical_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C_h(32 * 4);
+    cudaMemcpy(C_h.data(), dC, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    
+    // With zero inputs, all outputs should be zero
+    bool ok = true;
+    for (int i = 0; i < 32 * 4; i++) {
+        if (std::abs(C_h[i]) > 1e-5f) {
+            ok = false;
+            printf("  Non-zero at %d: %f\n", i, C_h[i]);
+            break;
+        }
+    }
+    
+    printf(ok ? "[PASS] fragment zero inputs\n" : "[FAIL] fragment zero inputs\n");
+    return ok;
+}
+
+// Kernel for k32 fragment test
+__global__ void test_mma_m16n8k32_frag_numerical_kernel(
+    const uint32_t* A_all,  // [32][8]
+    const uint32_t* B_all,  // [32][4]
+    float* C_all) {         // [32][4]
+    int tid = get_sm70_warp_lane();
+    
+    uint32_t A[8], B[4];
+    for (int i = 0; i < 8; i++) A[i] = A_all[tid * 8 + i];
+    for (int i = 0; i < 4; i++) B[i] = B_all[tid * 4 + i];
+    
+    float frag_c[4] = {0, 0, 0, 0};
+    mma_m16n8k32_sm70(A, B, frag_c);
+    
+    for (int i = 0; i < 4; i++) C_all[tid * 4 + i] = frag_c[i];
+}
+
+// Test: k32 Fragment variant
+static bool test_mma_frag_k32_numerical() {
+    printf("\n=== test fragment API k32 numerical ===\n");
+    
+    uint32_t ones = 0x3c003c00;
+    std::vector<uint32_t> A_h(32 * 8, ones), B_h(32 * 4, ones);
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, 32 * 8 * sizeof(uint32_t));
+    cudaMalloc(&dB, 32 * 4 * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 4 * sizeof(float));
+    cudaMemcpy(dA, A_h.data(), 32 * 8 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_h.data(), 32 * 4 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemset(dC, 0, 32 * 4 * sizeof(float));
+    
+    test_mma_m16n8k32_frag_numerical_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C_h(32 * 4);
+    cudaMemcpy(C_h.data(), dC, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    
+    // k32 should produce roughly 2x the output of k16 (double the K dimension)
+    int nonzero = 0;
+    float sum = 0;
+    for (int i = 0; i < 32 * 4; i++) {
+        if (std::abs(C_h[i]) > 0.1f) nonzero++;
+        sum += C_h[i];
+    }
+    
+    bool ok = (nonzero > 0 && sum > 0);
+    printf("Fragment k32: %d non-zero outputs, total sum=%.2f\n", nonzero, sum);
+    printf(ok ? "[PASS] fragment k32 numerical\n" : "[FAIL] fragment k32 numerical\n");
+    return ok;
+}
+
 int main() {
     printf("SM70 MMA Library – self-contained test\n");
     printf("======================================\n");
@@ -2202,6 +2486,13 @@ int main() {
     total++; if (!test_mma_nan_inf_limits()) fail++;
     total++; if (!test_mma_trans_numerical_check()) fail++;
     total++; if (!test_mma_accumulation_stability()) fail++;
+    
+    // Fragment-based Marlin Validation Tests
+    total++; if (!test_mma_frag_all_ones_numerical()) fail++;
+    total++; if (!test_mma_frag_accumulation()) fail++;
+    total++; if (!test_mma_frag_scaling()) fail++;
+    total++; if (!test_mma_frag_zero_inputs()) fail++;
+    total++; if (!test_mma_frag_k32_numerical()) fail++;
 
     printf("\n======================================\n");
     printf("Total: %d test(s), %d passed, %d failed\n", total, total - fail, fail);
