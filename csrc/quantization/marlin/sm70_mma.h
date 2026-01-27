@@ -162,7 +162,6 @@ __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70(
     
     int row_in_group = lane % 8;  // Which row within the 8-thread group
     int col_pair = (lane / 8) % 2;  // 0: cols 0-3, 1: cols 4-7 style offset
-    int tile_half = lane / 16;  // 0: top 8 rows, 1: bottom 8 rows
     
     // For m16n8k16 operand A (16 rows, 16 cols):
     // We need to shuffle to get the right halves to each thread
