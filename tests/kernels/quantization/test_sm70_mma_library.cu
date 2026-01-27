@@ -86,11 +86,52 @@ __device__ void mma_m16n8k16_sm70(
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
   float c[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
-  for (int k = 0; k < 4; ++k) {
-    half2 a = *reinterpret_cast<const half2*>(&A[k]);
-    half2 b = *reinterpret_cast<const half2*>(&B[k / 2]);
-    mma_m8n8k4_sm70(a, b, c[0], c[1], c[2], c[3]);
-  }
+  float dummy[2]; // Discard redundant accumulator outputs
+
+    // k=0
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[0]);
+        half2 b_pair = *reinterpret_cast<const half2*>(&B[0]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_use = __halves2half2(b_pair.x, b_pair.x);
+        mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
+    }
+
+    // k=1
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[1]);
+        half2 b_pair = *reinterpret_cast<const half2*>(&B[0]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_use = __halves2half2(b_pair.y, b_pair.y);
+        mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
+    }
+
+    // k=2
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[2]);
+        half2 b_pair = *reinterpret_cast<const half2*>(&B[1]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_use = __halves2half2(b_pair.x, b_pair.x);
+        mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
+    }
+
+    // k=3
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[3]);
+        half2 b_pair = *reinterpret_cast<const half2*>(&B[1]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_use = __halves2half2(b_pair.y, b_pair.y);
+        mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
+    }
+
   frag_c[0] = c[0];
   frag_c[1] = c[1];
   frag_c[2] = c[2];
@@ -132,15 +173,57 @@ __device__ void mma_m8n8k4_sm70_fp16(
 __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
                                         const uint32_t* B2, float* frag_c) {
   float c[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
-  for (int k = 0; k < 4; ++k) {
-    half2 a = *reinterpret_cast<const half2*>(&A[k]);
-    int i = k / 2;
-    int shift = (k % 2) * 16;
-    half2 b_tr = __halves2half2(
-        __ushort_as_half(static_cast<unsigned short>((B[i] >> shift) & 0xFFFF)),
-        __ushort_as_half(static_cast<unsigned short>((B2[i] >> shift) & 0xFFFF)));
-    mma_m8n8k4_sm70(a, b_tr, c[0], c[1], c[2], c[3]);
-  }
+  
+  float dummy[2]; // Added dummy declaration
+
+    // k=0
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[0]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_tr = __halves2half2(
+            __ushort_as_half(static_cast<unsigned short>(B[0] & 0xFFFF)),
+            __ushort_as_half(static_cast<unsigned short>(B2[0] & 0xFFFF)));
+        mma_m8n8k4_sm70(a_top, b_tr, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_tr, c[2], c[3], dummy[0], dummy[1]);
+    }
+
+    // k=1
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[1]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_tr = __halves2half2(
+            __ushort_as_half(static_cast<unsigned short>((B[0] >> 16) & 0xFFFF)),
+            __ushort_as_half(static_cast<unsigned short>((B2[0] >> 16) & 0xFFFF)));
+        mma_m8n8k4_sm70(a_top, b_tr, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_tr, c[2], c[3], dummy[0], dummy[1]);
+    }
+
+    // k=2
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[2]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_tr = __halves2half2(
+            __ushort_as_half(static_cast<unsigned short>(B[1] & 0xFFFF)),
+            __ushort_as_half(static_cast<unsigned short>(B2[1] & 0xFFFF)));
+        mma_m8n8k4_sm70(a_top, b_tr, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_tr, c[2], c[3], dummy[0], dummy[1]);
+    }
+
+    // k=3
+    {
+        half2 a = *reinterpret_cast<const half2*>(&A[3]);
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        half2 b_tr = __halves2half2(
+            __ushort_as_half(static_cast<unsigned short>((B[1] >> 16) & 0xFFFF)),
+            __ushort_as_half(static_cast<unsigned short>((B2[1] >> 16) & 0xFFFF)));
+        mma_m8n8k4_sm70(a_top, b_tr, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_tr, c[2], c[3], dummy[0], dummy[1]);
+    }
+
   frag_c[0] = c[0];
   frag_c[1] = c[1];
   frag_c[2] = c[2];
