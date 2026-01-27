@@ -175,7 +175,7 @@ __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70(
     // Bottom half (dst[2], dst[3]) comes from rows 8-15
     
     int src_row_top = row_in_group;  // lanes 0-7 have rows 0-7
-    int src_row_bot = row_in_group + 16;  // lanes 16-23 have rows 8-15
+    int src_row_bot = row_in_group + 8;  // lanes 8-15 have rows 8-15
     
     // Word selection based on column grouping
     // col_pair=0: words 0,1  col_pair=1: words 2,3

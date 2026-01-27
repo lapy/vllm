@@ -227,7 +227,7 @@ __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70_v1(
     int col_pair = (lane / 8) % 2;
     
     int src_row_top = row_in_group;
-    int src_row_bot = row_in_group + 16;
+    int src_row_bot = row_in_group + 8;
     
     int word_base = col_pair * 2;
     
