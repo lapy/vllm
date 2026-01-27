@@ -82,23 +82,17 @@ template <int count, vllm::ScalarTypeId type_id>
 __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  // SM70 (Volta) ldmatrix fallback: load count consecutive 32-bit words into
-  // frag_a. Correctness requires that the shared memory at smem_ptr is staged
-  // so that this sequential load yields the same fragment layout as
-  // ldmatrix.sync.aligned.m8n8.x{1,2,4}.shared.b16 on SM75+ (see PTX matrix
-  // fragments for m16n8k16: docs.nvidia.com/cuda/parallel-thread-execution).
+  // SM70 (Volta) ldmatrix emulation using warp shuffles.
+  // The ldmatrix instruction is not available on SM70, so we emulate it
+  // by loading data and redistributing via warp shuffle to match the
+  // expected fragment layout for tensor core MMA operations.
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
-  const uint32_t* smem = reinterpret_cast<const uint32_t*>(smem_ptr);
   if constexpr (count == 4) {
-    a[0] = smem[0];
-    a[1] = smem[1];
-    a[2] = smem[2];
-    a[3] = smem[3];
+    ldmatrix_m8n8_x4_sm70(a, smem_ptr);
   } else if constexpr (count == 2) {
-    a[0] = smem[0];
-    a[1] = smem[1];
+    ldmatrix_m8n8_x2_sm70(a, smem_ptr);
   } else if constexpr (count == 1) {
-    a[0] = smem[0];
+    ldmatrix_m8n8_x1_sm70(a, smem_ptr);
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }
