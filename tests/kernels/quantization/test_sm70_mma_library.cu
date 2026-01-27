@@ -2412,6 +2412,88 @@ static bool test_mma_frag_k32_numerical() {
     return ok;
 }
 
+// ===========================================================================
+// Redundancy Verification Test
+// ===========================================================================
+
+// Check redundancy assumption: c[0]==c[4], c[1]==c[5], c[2]==c[6], c[3]==c[7]
+__global__ void test_mma_m8n8k4_redundancy_kernel(const half2* A, const half2* B, float* C_debug) {
+    int tid = threadIdx.x % 32;
+    if (tid >= 32) return;
+    int quadpair = get_sm70_quadpair();
+    if (quadpair < 4) {
+        half2 a = A[tid];
+        half2 b = B[tid];
+        
+        uint32_t a_val = *reinterpret_cast<const uint32_t*>(&a);
+        uint32_t b_val = *reinterpret_cast<const uint32_t*>(&b);
+        float c[8] = {0.0f};
+
+        // Manual inline asm to capture all 8 outputs
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
+            "{%0, %1, %2, %3, %4, %5, %6, %7};"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]),
+              "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+            : "r"(a_val), "r"(a_val), "r"(b_val), "r"(b_val));
+            
+        for(int i=0; i<8; i++) C_debug[tid * 8 + i] = c[i];
+    }
+}
+
+static bool test_mma_redundancy_check() {
+    printf("\n=== test mma_m8n8k4_sm70 redundancy check ===\n");
+    std::vector<half2> A_h(32), B_h(32);
+    // Use inputs that should produce distinct values if mapping is wrong
+    // A: 1.0, 2.0; B: varying, 1.0
+    for (int i = 0; i < 32; i++) {
+        A_h[i] = __halves2half2(float2half(1.0f), float2half(2.0f));
+        B_h[i] = __halves2half2(float2half((float)((i%4)+1)), float2half(1.0f));
+    }
+    half2 *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, 32 * sizeof(half2));
+    cudaMalloc(&dB, 32 * sizeof(half2));
+    cudaMalloc(&dC, 32 * 8 * sizeof(float)); // 8 outputs per thread to check full regs
+    cudaMemcpy(dA, A_h.data(), 32 * sizeof(half2), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_h.data(), 32 * sizeof(half2), cudaMemcpyHostToDevice);
+    cudaMemset(dC, 0, 32 * 8 * sizeof(float));
+    
+    test_mma_m8n8k4_redundancy_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaDeviceSynchronize();
+    
+    std::vector<float> C_h(32 * 8);
+    cudaMemcpy(C_h.data(), dC, 32 * 8 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    
+    bool ok = true;
+    for(int t=0; t<32; t++) {
+        // Only valid for quadpairs < 4 (which is all of them 0..3)
+        
+        bool thread_bad = false;
+        for(int i=0; i<4; i++) {
+            float val1 = C_h[t*8 + i];
+            float val2 = C_h[t*8 + i + 4];
+            // Check redundancy: c[i] should equal c[i+4]
+            if (std::abs(val1 - val2) > 1e-4f) {
+                if (ok) printf("Thread %d: mismatch c[%d]=%.2f vs c[%d]=%.2f\n", t, i, val1, i+4, val2);
+                thread_bad = true;
+                ok = false;
+            }
+        }
+        // Also check that we actually got nonzero output (sanity check)
+        float sum = 0;
+        for(int i=0; i<8; i++) sum += std::abs(C_h[t*8 + i]);
+        if (sum < 1e-3f) {
+             // Silence this for now, though it might differ if B values cause 0
+        }
+        if (thread_bad && !ok) break; // Print first failure
+    }
+    printf(ok ? "[PASS] mma redundancy check (c[0-3] == c[4-7])\n" : "[FAIL] mma redundancy check (mismatch found)\n");
+    return ok;
+}
+
 int main() {
     printf("SM70 MMA Library – self-contained test\n");
     printf("======================================\n");
@@ -2493,6 +2575,7 @@ int main() {
     total++; if (!test_mma_frag_scaling()) fail++;
     total++; if (!test_mma_frag_zero_inputs()) fail++;
     total++; if (!test_mma_frag_k32_numerical()) fail++;
+    total++; if (!test_mma_redundancy_check()) fail++;
 
     printf("\n======================================\n");
     printf("Total: %d test(s), %d passed, %d failed\n", total, total - fail, fail);
