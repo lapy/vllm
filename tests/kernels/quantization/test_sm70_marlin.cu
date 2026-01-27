@@ -196,8 +196,8 @@ __global__ void marlin_simulation_kernel(
     // Let's use a naive load: B is [K=16, N=8].
     // We need frag_b to be useful.
     // Let's just fill frag_b from sh_b roughly.
-    frag_b[0] = sh_b[tid % 64]; 
-    frag_b[1] = sh_b[(tid + 1) % 64];
+    frag_b[0] = sh_b[tid * 2]; 
+    frag_b[1] = sh_b[tid * 2 + 1];
 
     
     // --- STAGE 3: Compute ---
@@ -258,9 +258,9 @@ __global__ void marlin_simulation_looped_kernel(
         
         ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
         
-        // Naive B Load
-        frag_b[0] = sh_b[tid % 64]; 
-        frag_b[1] = sh_b[(tid + 1) % 64];
+        // Unique B Load (Stride 2)
+        frag_b[0] = sh_b[tid * 2];
+        frag_b[1] = sh_b[tid * 2 + 1];
 
         // --- STAGE 3: Compute ---
         // Accumulate into frag_c
