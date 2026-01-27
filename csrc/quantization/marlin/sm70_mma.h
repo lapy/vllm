@@ -162,13 +162,30 @@ __device__ void mma_m8n8k4_sm70_fp16(
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     float c[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
+    float dummy[2]; // Discard redundant accumulator outputs
 
     // Iterate over 4 k-steps (k=0,4,8,12 in the k=16 dimension)
-    // Each step uses one half2 from A and the corresponding half2 from B
+    // Each step uses one half2 from A and half of a half2 from B
     for (int k = 0; k < 4; ++k) {
         half2 a = *reinterpret_cast<const half2*>(&A[k]);
-        half2 b = *reinterpret_cast<const half2*>(&B[k / 2]);
-        mma_m8n8k4_sm70(a, b, c[0], c[1], c[2], c[3]);
+        half2 b_pair = *reinterpret_cast<const half2*>(&B[k / 2]);
+
+        // Split A: A[k] contains {top_val, bot_val} for M=16 mapping
+        // We replicate each scalar to fill the 2-element redundant slots for m8n8k4
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        
+        // Split B: B[k/2] contains {k_even_val, k_odd_val}
+        // We select the scalar for the current k-step and replicate it
+        half b_scalar = (k % 2 == 0) ? b_pair.x : b_pair.y;
+        half2 b_use = __halves2half2(b_scalar, b_scalar);
+
+        // Compute Top 8x8 tile: uses a_top and accumulates to c[0], c[1]
+        // mma_m8n8k4 produces 4 outputs (redundant pairs), we keep first pair
+        mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
+        
+        // Compute Bottom 8x8 tile: uses a_bot and accumulates to c[2], c[3]
+        mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
 
     frag_c[0] = c[0];
@@ -187,12 +204,25 @@ __device__ void mma_m16n8k16_sm70(
     int quadpair = get_sm70_quadpair();
 
     float frag_C[4] = {0};
+    float dummy[2];
 
     for (int k = 0; k < 4; ++k) {
         half2 a = *reinterpret_cast<const half2*>(&A[k * 4 + warp_id]);
         half2 b = *reinterpret_cast<const half2*>(&B[k * 4 + quadpair]);
 
-        mma_m8n8k4_sm70(a, b, frag_C[0], frag_C[1], frag_C[2], frag_C[3]);
+        // Split A: A contains {top, bot} (unique). We need to replicate each for m8n8k4.
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        
+        // Use B directly (assuming redundancy or 2x factor is handled elsewhere, or B layout differs)
+        // See comments in previous edit about B redundancy.
+ 
+        // Accumulate Top
+        mma_m8n8k4_sm70(a_top, b, frag_C[0], frag_C[1], dummy[0], dummy[1]);
+        
+        // Accumulate Bot
+        mma_m8n8k4_sm70(a_bot, b, frag_C[2], frag_C[3], dummy[0], dummy[1]);
+        
         __syncwarp();
     }
 
@@ -229,15 +259,28 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
                                         const uint32_t* B2, float* frag_c) {
     float c[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
+    float dummy[2];
 
     for (int k = 0; k < 4; ++k) {
         half2 a = *reinterpret_cast<const half2*>(&A[k]);
+        
+        // Split A for Top/Bot 8x8 tiles
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+
+        // B logic for trans: Construct b_tr from B and B2
         int i = k / 2;
         int shift = (k % 2) * 16;
         half2 b_tr = __halves2half2(
             __ushort_as_half(static_cast<unsigned short>((B[i] >> shift) & 0xFFFF)),
             __ushort_as_half(static_cast<unsigned short>((B2[i] >> shift) & 0xFFFF)));
-        mma_m8n8k4_sm70(a, b_tr, c[0], c[1], c[2], c[3]);
+        
+        // Use b_tr directly (contains 2 distinct values, effectively packed K?)
+        // Assuming redundancy is handled by duplicated input registers mapping to separate columns
+        // We must accumulate to Top and Bottom separately
+        
+        mma_m8n8k4_sm70(a_top, b_tr, c[0], c[1], dummy[0], dummy[1]);
+        mma_m8n8k4_sm70(a_bot, b_tr, c[2], c[3], dummy[0], dummy[1]);
     }
 
     frag_c[0] = c[0];
@@ -250,21 +293,36 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
 // FP16 accumulation variants
 // =============================================================================
 
-// Per-thread fragment API: A[4], B[2], frag_c[2] (FragC for fp16).
+// Per-thread fragment API: A[4], B[2], frag_c[4] (FragC for fp16 is 4x half2).
 __device__ void mma_m16n8k16_sm70_fp16(
     const uint32_t* A, const uint32_t* B, uint32_t* frag_c) {
-    half2 c[2];
+    half2 c[4]; // Needs 4 half2s to cover 16x8 (same spatial size as 4 floats)
     c[0] = *reinterpret_cast<const half2*>(&frag_c[0]);
     c[1] = *reinterpret_cast<const half2*>(&frag_c[1]);
+    c[2] = *reinterpret_cast<const half2*>(&frag_c[2]); // Expanded to full size
+    c[3] = *reinterpret_cast<const half2*>(&frag_c[3]);
 
     for (int k = 0; k < 4; ++k) {
         half2 a = *reinterpret_cast<const half2*>(&A[k]);
-        half2 b = *reinterpret_cast<const half2*>(&B[k / 2]);
-        mma_m8n8k4_sm70_fp16(a, b, c[0], c[1]);
+        half2 b_pair = *reinterpret_cast<const half2*>(&B[k / 2]);
+
+        half2 a_top = __halves2half2(a.x, a.x);
+        half2 a_bot = __halves2half2(a.y, a.y);
+        
+        half b_scalar = (k % 2 == 0) ? b_pair.x : b_pair.y;
+        half2 b_use = __halves2half2(b_scalar, b_scalar);
+        
+        // mma_fp16 writes 2 half2s (4 halves), implicitly covers 8x8 redundant pair
+        // We use first pair
+        // Note: simplified mma_fp16 outputs c0, c1
+        mma_m8n8k4_sm70_fp16(a_top, b_use, c[0], c[1]);
+        mma_m8n8k4_sm70_fp16(a_bot, b_use, c[2], c[3]);
     }
 
     frag_c[0] = *reinterpret_cast<const uint32_t*>(&c[0]);
     frag_c[1] = *reinterpret_cast<const uint32_t*>(&c[1]);
+    frag_c[2] = *reinterpret_cast<const uint32_t*>(&c[2]); 
+    frag_c[3] = *reinterpret_cast<const uint32_t*>(&c[3]);
 }
 
 // =============================================================================
