@@ -3412,6 +3412,8 @@ int main() {
     total++; if (!test_ldmatrix_x1_basic()) fail++;
     total++; if (!test_ldmatrix_x2_basic()) fail++;
     total++; if (!test_ldmatrix_x4_basic()) fail++;
+    total++; if (!test_marlin_ldsm_comparison()) fail++;
+    total++; if (!test_ldmatrix_mma_pipeline()) fail++;
 
     printf("\n======================================\n");
     printf("Total: %d test(s), %d passed, %d failed\n", total, total - fail, fail);
