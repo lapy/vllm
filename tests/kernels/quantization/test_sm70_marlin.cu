@@ -839,6 +839,59 @@ bool test_marlin_simulation_small_blocks() {
     return true;
 }
 
+// Strict value integrity test for x2
+// Verifies that ldmatrix_x2 loads the exact 8 bytes pointed to by the thread.
+// T0 -> [0, 1, 2, 3] (halves) -> [0|1, 2|3] (u32s)
+// T... -> corresponding linear sequence
+bool test_ldmatrix_x2_integrity_values() {
+    printf("Running test_ldmatrix_x2_integrity_values...\n");
+    
+    // 32 threads. Each points to 16 bytes (row default stride) but we only read 8.
+    // Let's set up input such that input[i] = i.
+    // T0 reads words at 0, 1. (Value 0, 1).
+    // T1 reads words at 4, 5. (Value 4, 5). (Assuming linear mapping in test kernel)
+    
+    int num_u32 = 32 * 4;
+    std::vector<uint32_t> input(num_u32);
+    std::vector<uint32_t> output(32 * 2);
+    
+    for(int i=0; i<num_u32; i++) input[i] = i;
+    
+    uint32_t *d_in, *d_out;
+    cudaMalloc(&d_in, num_u32*4);
+    cudaMalloc(&d_out, output.size()*4);
+    
+    cudaMemcpy(d_in, input.data(), num_u32*4, cudaMemcpyHostToDevice);
+    
+    // Reuse x2 kernel
+    test_ldmatrix_x2_kernel<<<1, 32>>>(d_in, d_out);
+    
+    cudaMemcpy(output.data(), d_out, output.size()*4, cudaMemcpyDeviceToHost);
+    cudaFree(d_in); cudaFree(d_out);
+    
+    bool pass = true;
+    for(int t=0; t<32; t++) {
+        // We expect T to load from its row_ptr.
+        // In the test kernel: row_ptr = &sh_mem[t*4].
+        // So T should load sh_mem[t*4] and sh_mem[t*4+1].
+        // Values: t*4 and t*4+1.
+        
+        uint32_t expected_0 = t*4;
+        uint32_t expected_1 = t*4 + 1;
+        uint32_t got_0 = output[2*t];
+        uint32_t got_1 = output[2*t+1];
+        
+        if (got_0 != expected_0 || got_1 != expected_1) {
+            printf("FAILED: Thread %d integrity. Expected {%u, %u}, Got {%u, %u}\n", 
+                   t, expected_0, expected_1, got_0, got_1);
+            pass = false;
+        }
+    }
+    
+    if(pass) printf("PASSED (Data matches exactly)\n");
+    return pass;
+}
+
 int main() {
     bool all_pass = true;
     all_pass &= test_ldmatrix_perfect_reconstruction();
@@ -852,6 +905,7 @@ int main() {
     all_pass &= test_ldmatrix_x1_correctness();
     all_pass &= test_ldmatrix_x2_correctness();
     all_pass &= test_marlin_simulation_small_blocks();
+    all_pass &= test_ldmatrix_x2_integrity_values();
     
     if (all_pass) {
         printf("\nALL TESTS PASSED\n");
