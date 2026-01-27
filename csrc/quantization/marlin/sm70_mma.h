@@ -190,77 +190,15 @@ __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70(
     dst[3] = __shfl_sync(FULL_MASK, my_words[word_base + 1], src_row_bot);
 }
 
-// Alternative ldmatrix that handles the trans variant (.trans modifier)
-// For transposed B matrix loading
-__device__ __forceinline__ void ldmatrix_m8n8_x2_trans_sm70(
-    uint32_t* dst,
-    const void* smem_ptr)
-{
-    const int lane = threadIdx.x % 32;
-    const uint32_t FULL_MASK = 0xFFFFFFFF;
-    
-    // For transposed load, columns become rows
-    // Thread provides column address, receives row elements
-    const uint32_t* col_ptr = reinterpret_cast<const uint32_t*>(smem_ptr);
-    
-    // Load column data
-    uint32_t my_words[4];
-    my_words[0] = col_ptr[0];
-    my_words[1] = col_ptr[1];
-    my_words[2] = col_ptr[2];
-    my_words[3] = col_ptr[3];
-    
-    int col_in_tile = lane % 8;
-    int row_group = (lane / 8) % 2;
-    
-    // Shuffle for transposed access pattern
-    uint32_t v0 = __shfl_sync(FULL_MASK, my_words[row_group * 2 + 0], col_in_tile);
-    uint32_t v1 = __shfl_sync(FULL_MASK, my_words[row_group * 2 + 1], col_in_tile);
-    
-    dst[0] = v0;
-    dst[1] = v1;
-}
 
-// =============================================================================
-// SM70 register mapping helpers for FP32 accumulator
-// =============================================================================
 
-// Get the row index in the output matrix for fragment element i
-__device__ __forceinline__ int sm70_frag_row_f32(int tid, int i) {
-    return ((tid & 16) >> 2) + 2 * ((tid & 4) >> 2) + (tid & 1) + (i & 2);
-}
 
-// Get the column index in the output matrix for fragment element i
-__device__ __forceinline__ int sm70_frag_col_f32(int tid, int i) {
-    return (tid & 10) + (i & 5);
-}
 
 // =============================================================================
 // Core 8x8x4 MMA operations for Volta
 // =============================================================================
 
-// Core m8n8k4 MMA with FP32 accumulation
-// PTX requires: 2 half2 for A, 2 half2 for B, 8 f32 for C/D
-// Each thread provides its portion of the distributed matrix
-__device__ void mma_m8n8k4_sm70(
-    const half2& a0, const half2& a1,  // Two A registers
-    const half2& b0, const half2& b1,  // Two B registers
-    float& c0, float& c1, float& c2, float& c3,
-    float& c4, float& c5, float& c6, float& c7) 
-{
-    uint32_t a0_val = *reinterpret_cast<const uint32_t*>(&a0);
-    uint32_t a1_val = *reinterpret_cast<const uint32_t*>(&a1);
-    uint32_t b0_val = *reinterpret_cast<const uint32_t*>(&b0);
-    uint32_t b1_val = *reinterpret_cast<const uint32_t*>(&b1);
 
-    asm volatile(
-        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
-        "{%0, %1, %2, %3, %4, %5, %6, %7};"
-        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3),
-          "+f"(c4), "+f"(c5), "+f"(c6), "+f"(c7)
-        : "r"(a0_val), "r"(a1_val), "r"(b0_val), "r"(b1_val));
-}
 
 // Simplified 4-output version for marlin compatibility
 // Internally uses all 8 outputs but only returns the first 4
@@ -289,33 +227,7 @@ __device__ void mma_m8n8k4_sm70(
     c3 = c_ext[3];
 }
 
-// Core m8n8k4 MMA with FP16 accumulation
-__device__ void mma_m8n8k4_sm70_fp16(
-    const half2& a0, const half2& a1,
-    const half2& b0, const half2& b1,
-    half2& c0, half2& c1, half2& c2, half2& c3) 
-{
-    uint32_t a0_val = *reinterpret_cast<const uint32_t*>(&a0);
-    uint32_t a1_val = *reinterpret_cast<const uint32_t*>(&a1);
-    uint32_t b0_val = *reinterpret_cast<const uint32_t*>(&b0);
-    uint32_t b1_val = *reinterpret_cast<const uint32_t*>(&b1);
-    uint32_t d[4];
-    d[0] = *reinterpret_cast<const uint32_t*>(&c0);
-    d[1] = *reinterpret_cast<const uint32_t*>(&c1);
-    d[2] = *reinterpret_cast<const uint32_t*>(&c2);
-    d[3] = *reinterpret_cast<const uint32_t*>(&c3);
 
-    asm volatile(
-        "mma.sync.aligned.m8n8k4.row.col.f16.f16.f16.f16 "
-        "{%0, %1, %2, %3}, {%4, %5}, {%6, %7}, {%0, %1, %2, %3};"
-        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-        : "r"(a0_val), "r"(a1_val), "r"(b0_val), "r"(b1_val));
-
-    c0 = *reinterpret_cast<half2*>(&d[0]);
-    c1 = *reinterpret_cast<half2*>(&d[1]);
-    c2 = *reinterpret_cast<half2*>(&d[2]);
-    c3 = *reinterpret_cast<half2*>(&d[3]);
-}
 
 // Simplified FP16 version (2 output registers)
 __device__ void mma_m8n8k4_sm70_fp16(
@@ -404,62 +316,7 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
     frag_c[3] = c[3];
 }
 
-// Version that writes results to global memory C[m][n]
-// Used for testing and verification
-__device__ void mma_m16n8k16_sm70(
-    const uint32_t* A, const uint32_t* B, 
-    float* C, int m, int n) 
-{
-    int warp_id = get_sm70_warp_lane() / 16;
-    int quadpair = get_sm70_quadpair();
 
-    float frag_C[4] = {0};
-    float dummy[2];
-
-    for (int k = 0; k < 4; ++k) {
-        half2 a = *reinterpret_cast<const half2*>(&A[k * 4 + warp_id]);
-        half2 b = *reinterpret_cast<const half2*>(&B[k * 4 + quadpair]);
-
-        // Split A: A contains {top, bot} (unique). We need to replicate each for m8n8k4.
-        half2 a_top = __halves2half2(a.x, a.x);
-        half2 a_bot = __halves2half2(a.y, a.y);
-        
-        // Use B directly (assuming redundancy or 2x factor is handled elsewhere, or B layout differs)
-        // See comments in previous edit about B redundancy.
- 
-        // Accumulate Top
-        mma_m8n8k4_sm70(a_top, b, frag_C[0], frag_C[1], dummy[0], dummy[1]);
-        
-        // Accumulate Bot
-        mma_m8n8k4_sm70(a_bot, b, frag_C[2], frag_C[3], dummy[0], dummy[1]);
-        
-        __syncwarp();
-    }
-
-    if (quadpair < 2) {
-        for (int i = 0; i < 4; ++i) {
-            int row = warp_id * 8 + i;
-            int col = quadpair * 4 + (i % 4);
-            if (row < m && col < n) {
-                atomicAdd(&C[row * n + col], frag_C[i]);
-            }
-        }
-    }
-}
-
-// Version with optional C clearing
-__device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
-                                  float* C, bool no_c_clear) {
-    const int m = 16, n = 8;
-    if (!no_c_clear) {
-        int tid = get_sm70_warp_lane();
-        if (tid == 0) {
-            for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-        }
-        __syncwarp();
-    }
-    mma_m16n8k16_sm70(A, B, C, m, n);
-}
 
 // =============================================================================
 // Transposed B variants
@@ -565,18 +422,7 @@ __device__ void mma_m16n8k16_sm70_fp16(
 // 16x8x32 MMA operations (composed from 2x m16n8k16)
 // =============================================================================
 
-// Version that writes to global memory
-__device__ void mma_m16n8k32_sm70(
-    const uint32_t* A, const uint32_t* B,
-    float* C, int m, int n)
-{
-    // For k_size=32, we need A[32 uint32_t] and B[16 uint32_t]
-    // Split into two k_size=16 operations:
-    // 1. A[0:16] × B[0:8] → accumulate to C
-    // 2. A[16:32] × B[8:16] → accumulate to C
-    mma_m16n8k16_sm70(A, B, C, m, n);
-    mma_m16n8k16_sm70(A + 16, B + 8, C, m, n);
-}
+
 
 // Per-thread fragment API: A[8], B[4], frag_c[4]. Two 16x8x16 steps.
 __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
@@ -585,18 +431,6 @@ __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
     mma_m16n8k16_sm70(A + 4, B + 2, frag_c);
 }
 
-// Version with optional C clearing
-__device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
-                                  float* C, bool no_c_clear) {
-    const int m = 16, n = 8;
-    if (!no_c_clear) {
-        int tid = get_sm70_warp_lane();
-        if (tid == 0) {
-            for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-        }
-        __syncwarp();
-    }
-    mma_m16n8k32_sm70(A, B, C, m, n);
-}
+
 
 } // namespace MARLIN_NAMESPACE_NAME

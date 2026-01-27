@@ -27,61 +27,9 @@ __device__ __forceinline__ int get_sm70_quadpair() {
     return (threadIdx.x % 32) / 8;
 }
 
-__device__ void mma_m8n8k4_sm70(
-    const half2& a, const half2& b,
-    float& c0, float& c1, float& c2, float& c3) {
-    uint32_t a_val = *reinterpret_cast<const uint32_t*>(&a);
-    uint32_t b_val = *reinterpret_cast<const uint32_t*>(&b);
-    float c_ext[8] = {c0, c1, c2, c3, 0.0f, 0.0f, 0.0f, 0.0f};
-    asm volatile(
-        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
-        "{%0, %1, %2, %3, %4, %5, %6, %7};"
-        : "+f"(c_ext[0]), "+f"(c_ext[1]), "+f"(c_ext[2]), "+f"(c_ext[3]),
-          "+f"(c_ext[4]), "+f"(c_ext[5]), "+f"(c_ext[6]), "+f"(c_ext[7])
-        : "r"(a_val), "r"(a_val), "r"(b_val), "r"(b_val));
-    c0 = c_ext[0];
-    c1 = c_ext[1];
-    c2 = c_ext[2];
-    c3 = c_ext[3];
-}
 
-// Global memory version: Uses a single thread (tid 0) to perform 
-// CPU-style matmul for testing numerical correctness.
-// The fragment-based versions have complex thread-to-output mappings
-// that are designed for real kernel usage, not for simple tests.
-__device__ void mma_m16n8k16_sm70(
-    const uint32_t* A, const uint32_t* B,
-    float* C, int m, int n) {
-    int tid = get_sm70_warp_lane();
-    // Only thread 0 performs the computation to avoid overcounting
-    if (tid == 0) {
-        // Unpack A: 16 uint32_t = 32 half values for 16x16 matrix? 
-        // Actually for m16n8k16: A is 16x16, B is 16x8
-        // A is packed as 16 uint32_t = 32 halves (not enough for 16x16=256)
-        // The packed format assumes specific fragment layout.
-        // For testing, we interpret as linear row-major with K=16.
-        // A: m rows x k cols, packed as (m*k/2) uint32_t
-        // B: k rows x n cols, packed as (k*n/2) uint32_t
-        
-        const int M = 16, N = 8, K = 16;
-        const half* A_h = reinterpret_cast<const half*>(A);
-        const half* B_h = reinterpret_cast<const half*>(B);
-        
-        for (int i = 0; i < M && i < m; i++) {
-            for (int j = 0; j < N && j < n; j++) {
-                float sum = C[i * n + j]; // Start with existing value (accumulate)
-                for (int kk = 0; kk < K; kk++) {
-                    float a_val = __half2float(A_h[i * K + kk]);
-                    float b_val = __half2float(B_h[kk * N + j]);
-                    sum += a_val * b_val;
-                }
-                C[i * n + j] = sum;
-            }
-        }
-    }
-    __syncwarp();
-}
+
+
 
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
@@ -138,18 +86,7 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
   frag_c[3] = c[3];
 }
 
-__device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
-                                  float* C, bool no_c_clear) {
-  const int m = 16, n = 8;
-  if (!no_c_clear) {
-    int tid = get_sm70_warp_lane();
-    if (tid == 0) {
-      for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-    }
-    __syncwarp();
-  }
-  mma_m16n8k16_sm70(A, B, C, m, n);
-}
+
 
 __device__ void mma_m8n8k4_sm70_fp16(
     const half2& a, const half2& b,
@@ -244,12 +181,7 @@ __device__ void mma_m16n8k16_sm70_fp16(
   frag_c[1] = *reinterpret_cast<const uint32_t*>(&c[1]);
 }
 
-__device__ void mma_m16n8k32_sm70(
-    const uint32_t* A, const uint32_t* B,
-    float* C, int m, int n) {
-    mma_m16n8k16_sm70(A, B, C, m, n);
-    mma_m16n8k16_sm70(A + 16, B + 8, C, m, n);
-}
+
 
 __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
@@ -257,18 +189,7 @@ __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
   mma_m16n8k16_sm70(A + 4, B + 2, frag_c);
 }
 
-__device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
-                                  float* C, bool no_c_clear) {
-  const int m = 16, n = 8;
-  if (!no_c_clear) {
-    int tid = get_sm70_warp_lane();
-    if (tid == 0) {
-      for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-    }
-    __syncwarp();
-  }
-  mma_m16n8k32_sm70(A, B, C, m, n);
-}
+
 
 // ---------------------------------------------------------------------------
 // ldmatrix emulation for SM70 - TEST VERSIONS
@@ -480,38 +401,11 @@ __global__ void test_warp_utils(int* lane_out, int* quad_out) {
     }
 }
 
-__global__ void test_mma_m8n8k4_sm70_kernel(const half2* A, const half2* B, float* C) {
-    int tid = threadIdx.x % 32;
-    if (tid >= 32) return;
-    int quadpair = get_sm70_quadpair();
-    if (quadpair < 4) {
-        half2 a = A[tid];
-        half2 b = B[tid];
-        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
-        mma_m8n8k4_sm70(a, b, c0, c1, c2, c3);
-        C[tid * 4 + 0] = c0;
-        C[tid * 4 + 1] = c1;
-        C[tid * 4 + 2] = c2;
-        C[tid * 4 + 3] = c3;
-    }
-}
 
-__global__ void test_mma_m16n8k16_sm70_kernel(const uint32_t* A, const uint32_t* B, float* C, int m, int n, bool no_c_clear = false) {
-    int tid = threadIdx.x % 32;
-    if (!no_c_clear && tid == 0)
-        for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-    __syncthreads();
-    mma_m16n8k16_sm70(A, B, C, m, n);
-}
 
-__global__ void test_mma_m16n8k16_sm70_kernel(const uint32_t* A, const uint32_t* B, float* C, bool no_c_clear = false) {
-    const int m = 16, n = 8;
-    int tid = threadIdx.x % 32;
-    if (!no_c_clear && tid == 0)
-        for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-    __syncthreads();
-    mma_m16n8k16_sm70(A, B, C, m, n);
-}
+
+
+
 
 __global__ void test_mma_m8n8k4_sm70_fp16_kernel(const half2* A, const half2* B, half2* C) {
     int tid = threadIdx.x % 32;
@@ -542,63 +436,13 @@ __global__ void test_mma_m16n8k16_sm70_fp16_kernel(const uint32_t* A, const uint
     mma_m16n8k16_sm70_fp16(A, B, C);
 }
 
-__global__ void test_mma_m16n8k32_sm70_kernel(const uint32_t* A, const uint32_t* B, float* C, int m, int n) {
-    int tid = threadIdx.x % 32;
-    if (tid == 0)
-        for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-    __syncthreads();
-    mma_m16n8k32_sm70(A, B, C, m, n);
-}
 
-__global__ void test_mma_m8n8k4_accumulation_kernel(const half2* A, const half2* B, float* C) {
-    int tid = threadIdx.x % 32;
-    if (tid >= 32) return;
-    int quadpair = get_sm70_quadpair();
-    if (quadpair < 4) {
-        half2 a = A[tid];
-        half2 b = B[tid];
-        float c0 = 1.0f, c1 = 2.0f, c2 = 3.0f, c3 = 4.0f; // Non-zero initial values
-        mma_m8n8k4_sm70(a, b, c0, c1, c2, c3);
-        C[tid * 4 + 0] = c0;
-        C[tid * 4 + 1] = c1;
-        C[tid * 4 + 2] = c2;
-        C[tid * 4 + 3] = c3;
-    }
-}
 
-__global__ void test_mma_m8n8k4_multiple_iterations_kernel(const half2* A, const half2* B, float* C, int iterations) {
-    int tid = threadIdx.x % 32;
-    if (tid >= 32) return;
-    int quadpair = get_sm70_quadpair();
-    if (quadpair < 4) {
-        half2 a = A[tid];
-        half2 b = B[tid];
-        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
-        for (int i = 0; i < iterations; i++) {
-            mma_m8n8k4_sm70(a, b, c0, c1, c2, c3);
-        }
-        C[tid * 4 + 0] = c0;
-        C[tid * 4 + 1] = c1;
-        C[tid * 4 + 2] = c2;
-        C[tid * 4 + 3] = c3;
-    }
-}
 
-__global__ void test_mma_m8n8k4_zero_inputs_kernel(const half2* A, const half2* B, float* C) {
-    int tid = threadIdx.x % 32;
-    if (tid >= 32) return;
-    int quadpair = get_sm70_quadpair();
-    if (quadpair < 4) {
-        half2 a = A[tid];
-        half2 b = B[tid];
-        float c0 = 5.0f, c1 = 6.0f, c2 = 7.0f, c3 = 8.0f;
-        mma_m8n8k4_sm70(a, b, c0, c1, c2, c3);
-        C[tid * 4 + 0] = c0;
-        C[tid * 4 + 1] = c1;
-        C[tid * 4 + 2] = c2;
-        C[tid * 4 + 3] = c3;
-    }
-}
+
+
+
+
 
 __global__ void test_mma_m16n8k16_sm70_frag_kernel(const uint32_t* A, const uint32_t* B, float* C) {
     float frag_c[4] = {0, 0, 0, 0};
@@ -607,9 +451,7 @@ __global__ void test_mma_m16n8k16_sm70_frag_kernel(const uint32_t* A, const uint
     for (int i = 0; i < 4; i++) C[tid * 4 + i] = frag_c[i];
 }
 
-__global__ void test_mma_m16n8k16_sm70_noclear_kernel(const uint32_t* A, const uint32_t* B, float* C, bool no_c_clear) {
-    mma_m16n8k16_sm70(A, B, C, no_c_clear);
-}
+
 
 __global__ void test_mma_m16n8k16_sm70_trans_frag_kernel(const uint32_t* A, const uint32_t* B, const uint32_t* B2, float* C) {
     float frag_c[4] = {0, 0, 0, 0};
@@ -632,17 +474,9 @@ __global__ void test_mma_m16n8k32_sm70_frag_kernel(const uint32_t* A, const uint
     for (int i = 0; i < 4; i++) C[tid * 4 + i] = frag_c[i];
 }
 
-__global__ void test_mma_m16n8k32_sm70_noclear_kernel(const uint32_t* A, const uint32_t* B, float* C, bool no_c_clear) {
-    mma_m16n8k32_sm70(A, B, C, no_c_clear);
-}
 
-__global__ void test_mma_m16n8k16_numerical_kernel(const uint32_t* A, const uint32_t* B, float* C, int m, int n) {
-    int tid = threadIdx.x % 32;
-    if (tid == 0)
-        for (int i = 0; i < m * n; i++) C[i] = 0.0f;
-    __syncthreads();
-    mma_m16n8k16_sm70(A, B, C, m, n);
-}
+
+
 
 // ---------------------------------------------------------------------------
 // ldmatrix test kernels
