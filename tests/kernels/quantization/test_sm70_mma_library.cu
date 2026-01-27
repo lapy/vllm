@@ -19,6 +19,19 @@
 // Inlined SM70 MMA implementations (from sm70_mma.h, asm constraints fixed)
 // ---------------------------------------------------------------------------
 
+__device__ __forceinline__ void mma_m8n8k4_sm70(
+    const half2& a, const half2& b,
+    float& c0, float& c1,
+    float& c2, float& c3) {
+    uint32_t a_val = *reinterpret_cast<const uint32_t*>(&a);
+    uint32_t b_val = *reinterpret_cast<const uint32_t*>(&b);
+    asm volatile(
+        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5}, {%6, %7}, {%0, %1, %2, %3};"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a_val), "r"(a_val), "r"(b_val), "r"(b_val));
+}
+
 __device__ __forceinline__ int get_sm70_warp_lane() {
     return threadIdx.x % 32;
 }
@@ -736,7 +749,9 @@ static bool test_get_sm70_warp_lane_quadpair() {
     return ok;
 }
 
-// ---- Additional tests ----static bool test_warp_utils_64_threads() {
+// ---- Additional tests ----
+
+static bool test_warp_utils_64_threads() {
     printf("\n=== test warp utils 64 threads ===\n");
     int *d_lane, *d_quad;
     cudaMalloc(&d_lane, 64 * sizeof(int));
@@ -757,7 +772,9 @@ static bool test_get_sm70_warp_lane_quadpair() {
     }
     printf(ok ? "[PASS] warp utils 64 threads\n" : "[FAIL] warp utils 64 threads\n");
     return ok;
-}static bool test_mma_m16n8k16_frag() {
+}
+
+static bool test_mma_m16n8k16_frag() {
     printf("\n=== test mma_m16n8k16_sm70 (frag) ===\n");
     std::vector<uint32_t> A_p(16, 0x3c003c00); // 1.0f in fp16
     std::vector<uint32_t> B_p(8, 0x3c003c00);
@@ -778,7 +795,9 @@ static bool test_get_sm70_warp_lane_quadpair() {
     for (int i = 0; i < 32 * 4; i++) if (C_h[i] > 0.1f) { has = true; break; }
     printf(has ? "[PASS] mma_m16n8k16_sm70 (frag)\n" : "[FAIL] mma_m16n8k16_sm70 (frag)\n");
     return has;
-}static bool test_mma_m16n8k16_trans_frag() {
+}
+
+static bool test_mma_m16n8k16_trans_frag() {
     printf("\n=== test mma_m16n8k16_sm70_trans (frag) ===\n");
     std::vector<uint32_t> A_p(16, 0x3c003c00);
     std::vector<uint32_t> B_p(8, 0x3c003c00);
