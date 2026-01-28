@@ -91,11 +91,15 @@ __global__ void test_mma_m16n8k16_kernel(const uint32_t* A, const uint32_t* B, f
     float frag_c[4] = {0.0f};
     mma_m16n8k16_sm70(A, B, frag_c);
     
-    // Store outputs (each thread writes 4 values)
+    // Store outputs using correct FragC layout for SM70 (16x8 block)
     int tid = threadIdx.x;
-    for (int i = 0; i < 4; i++) {
-        C[tid * 4 + i] = frag_c[i];
-    }
+    int core_row = (tid % 8);
+    int core_col_base = (tid / 8); 
+    
+    C[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
+    C[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
+    C[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
+    C[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
 }
 
 __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t* B, const uint32_t* B2, float* C) {
@@ -103,9 +107,13 @@ __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t
     mma_m16n8k16_sm70_trans(A, B, B2, frag_c);
     
     int tid = threadIdx.x;
-    for (int i = 0; i < 4; i++) {
-        C[tid * 4 + i] = frag_c[i];
-    }
+    int core_row = (tid % 8);
+    int core_col_base = (tid / 8); 
+    
+    C[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
+    C[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
+    C[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
+    C[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
 }
 
 __global__ void test_ldmatrix_kernel(const uint32_t* input, uint32_t* output) {
@@ -139,7 +147,7 @@ __global__ void marlin_simulation_kernel(
     const uint32_t* A_global, // [16, 16] packed halves -> [16/16, 16] int4 ? No, simplified.
                               // Input A is 16x16 halves = 256 elems = 128 uint32
     const uint32_t* B_global, // [16, 8] halves = 128 elems = 64 uint32
-    float* C_global           // [16, 8] floats = 128 floats
+    float* C_global           // [16, 8] floats
 ) {
     // Shared memory buffer
     // Marlin uses int4* sh, but let's use uint32_t for simplicity in this test
@@ -188,10 +196,14 @@ __global__ void marlin_simulation_kernel(
     mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
     
     // --- STAGE 4: Store ---
-    // Store frag_c to global for validation
-    for(int i=0; i<4; i++) {
-        C_global[tid * 4 + i] = frag_c[i];
-    }
+    // Correct store for FragC layout on SM70 (16x8 block)
+    int core_row = (tid % 8);
+    int core_col_base = (tid / 8); 
+    
+    C_global[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
+    C_global[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
+    C_global[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
+    C_global[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
 }
 
 // =============================================================================
@@ -279,9 +291,13 @@ __global__ void marlin_simulation_looped_kernel(
     }
     
     // --- STAGE 4: Store ---
-    for(int i=0; i<4; i++) {
-        C_global[tid * 4 + i] = frag_c[i];
-    }
+    int core_row = (tid % 8);
+    int core_col_base = (tid / 8); 
+    
+    C_global[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
+    C_global[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
+    C_global[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
+    C_global[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
 }
 
 // -----------------------------------------------------------------------------
@@ -366,9 +382,13 @@ __global__ void marlin_simulation_dequant_kernel(
     float frag_c[4] = {0.0f};
     mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
     
-    for(int i=0; i<4; i++) {
-        C_global[tid * 4 + i] = frag_c[i];
-    }
+    int core_row = (tid % 8);
+    int core_col_base = (tid / 8); 
+    
+    C_global[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
+    C_global[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
+    C_global[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
+    C_global[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
 }
 
 // Host reference for 4-bit dequantization (GPTQ style)
@@ -480,8 +500,14 @@ bool test_marlin_performance() {
     cudaMalloc(&dB, K*N*sizeof(half));
     cudaMalloc(&dC, M*N*sizeof(float));
     
-    cudaMemcpy(dA, A_ref.data(), M*K*sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B_ref.data(), K*N*sizeof(half), cudaMemcpyHostToDevice);
+    // Pack A and B for the looped kernel
+    std::vector<uint32_t> A_packed(M*K/2);
+    std::vector<uint32_t> B_packed(K*N/2);
+    pack_halves(A_packed.data(), A_ref.data(), M*K/2);
+    pack_halves(B_packed.data(), B_ref.data(), K*N/2);
+
+    cudaMemcpy(dA, A_packed.data(), A_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -547,15 +573,25 @@ bool test_mma_random_numerical() {
     float *d_C;
     cudaMalloc(&d_A, A_packed.size()*sizeof(uint32_t));
     cudaMalloc(&d_B, 32 * 8 * sizeof(uint32_t)); // 32 threads * 8 regs
-    cudaMalloc(&d_C, M*N*sizeof(float));
+    cudaMalloc(&d_C, M*N*sizeof(float)); // M*N floats for the 16x8 output
     
-    cudaMemcpy(d_A, A_packed.data(), A_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
-    // Fill d_B with some data (just copy B_packed multiple times or whatever)
-    std::vector<uint32_t> B_expanded(32 * 4);
-    for(int i=0; i<32*4; i++) B_expanded[i] = B_packed[i % B_packed.size()];
-    cudaMemcpy(d_B, B_expanded.data(), B_expanded.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // For test_mma_m16n8k16_kernel, A and B are interpreted as thread-local fragments.
+    // To match the CPU reference, we need to ensure the fragments passed to the kernel
+    // correspond to the 16x16 A block and 16x8 B block used in matmul_cpu.
+    // This is complex due to the MMA fragment layout.
+    // For now, we'll simplify and pass the first 32*4 uint32s of A and 32*8 uint32s of B.
+    // The `test_mma_m16n8k16_kernel` will then compute a 16x8 block based on these fragments.
+    // The CPU reference `matmul_cpu` computes a 16x8 block from the full A and B.
+    // This test is primarily for the MMA instruction itself, assuming correct fragment distribution.
+    // The `marlin_simulation_kernel` tests the full pipeline including fragment distribution.
+
+    // Copy first 32*4 uint32s from A_packed to d_A
+    cudaMemcpy(d_A, A_packed.data(), 32*4*sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // Copy first 32*8 uint32s from B_packed to d_B
+    cudaMemcpy(d_B, B_packed.data(), 32*8*sizeof(uint32_t), cudaMemcpyHostToDevice);
     
     test_mma_m16n8k16_kernel<<<1, 32>>>(d_A, d_B, d_C);
+    CUDA_CHECK(cudaGetLastError());
     
     std::vector<float> C_out(M*N);
     cudaMemcpy(C_out.data(), d_C, M*N*sizeof(float), cudaMemcpyDeviceToHost);
@@ -563,31 +599,19 @@ bool test_mma_random_numerical() {
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     
     // For random input check, we need to know the mapping.
-    // The kernel dumps raw fragments.
-    // Thread i holds 4 values.
-    // We assume the test kernel's dump is "Per-Thread", not rearranged to matrix.
-    // Comparing with CPU requires mapping the CPU result to the fragment layout OR mapping fragments to Matrix.
-    // Mapping Fragments -> Matrix is complex (depends on opaque mma layout).
-    // However, if we trust that the *SUM* is correct, or just check 'sanity' that values are in range.
-    // BETTER approach: Use constant values that produce distinct results if shuffled wrong?
-    // Actually, for this specific test, let's just ensure finite values and rough magnitude match.
-    // Exact check without mapping is hard.
-    
-    // Let's refine:
-    // We can just verify that no NaN/Inf and values are non-zero.
-    float max_val = 0.0f;
-    for(float f : C_out) {
-        if(std::isnan(f) || std::isinf(f)) { 
-             printf("FAILED: Found NaN/Inf\n"); return false;
-        }
-        max_val = std::max(max_val, std::abs(f));
+    // We now use the correct FragC layout mapping in the kernel.
+    float max_err = 0;
+    for(int i=0; i<M*N; i++) {
+        float err = abs(C_out[i] - C_ref[i]);
+        if(err > max_err) max_err = err;
     }
-    if (max_val < 0.1f) {
-        printf("FAILED: All outputs close to zero\n");
+    
+    if(max_err > 0.05f) {
+        printf("FAILED: Max abs error %f exceeds tolerance\n", max_err);
         return false;
     }
     
-    printf("PASSED (Sanity check only - specific mapping not verified)\n");
+    printf("PASSED (Random numerical check successful)\n");
     return true;
 }
 
@@ -629,6 +653,7 @@ bool test_ldmatrix_strict_pattern() {
     cudaMalloc(&d_out, 32*4*sizeof(uint32_t));
     
     test_ldmatrix_strict_pattern_kernel<<<1, 32>>>(d_out);
+    CUDA_CHECK(cudaGetLastError());
     
     std::vector<uint32_t> out(32*4);
     cudaMemcpy(out.data(), d_out, 32*4*sizeof(uint32_t), cudaMemcpyDeviceToHost);
@@ -670,26 +695,19 @@ bool test_ldmatrix_strict_pattern() {
 // Increases K significantly to verify stability and accumulation accuracy over many iterations.
 bool test_marlin_simulation_looped() {
     printf("Running test_marlin_simulation_looped (Stress Test)...\n");
+    const int M=16, N=8, K_large=256; // K_large is the number of 16-K chunks
+    const int K = 16 * K_large; // Total K dimension
     
-    // Increase K_iters to stress the loop and memory pipeline
-    int K_iters = 256; // Total K = 16 * 256 = 4096
-    int M=16, N=8, K=16*K_iters;
-    
-    // Host Data
     std::vector<half> A_ref(M*K);
     std::vector<half> B_ref(K*N);
+    
+    std::default_random_engine generator(123);
+    std::uniform_real_distribution<float> dist(-1.0, 1.0);
+    
+    for(int i=0; i<M*K; i++) A_ref[i] = __float2half(dist(generator));
+    for(int i=0; i<K*N; i++) B_ref[i] = __float2half(dist(generator));
+    
     std::vector<float> C_ref(M*N);
-    
-    // Initialize with A=1.0, B=Random
-    // We use A=1.0 to check accumulation correctness (Sum(C) == Sum(B)) invariant of permutation.
-    
-    std::default_random_engine generator(42);
-    std::uniform_real_distribution<float> distribution(-0.5, 0.5);
-    
-    for(int i=0; i<M*K; i++) A_ref[i] = __float2half(1.0f);
-    for(int i=0; i<K*N; i++) B_ref[i] = __float2half(distribution(generator));
-    
-    // Calculate Reference
     matmul_cpu(A_ref.data(), B_ref.data(), C_ref.data(), M, N, K);
     
     // Pack Data for Device
