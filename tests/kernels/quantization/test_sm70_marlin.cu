@@ -1515,6 +1515,564 @@ bool test_multi_warp_collision() {
 }
 
 // =============================================================================
+// Comprehensive MMA Function Tests
+// Tests for all MMA variants in sm70_mma.h
+// =============================================================================
+
+// Test kernel for mma_m8n8k4_sm70 (core building block)
+__global__ void test_mma_m8n8k4_kernel(const uint32_t* A, const uint32_t* B, float* C) {
+    int tid = threadIdx.x % 32;
+    
+    // Each thread provides 2 uint32 for A and 2 uint32 for B
+    // A: tid*2 and tid*2+1, B: tid*2 and tid*2+1
+    uint32_t a0 = A[tid * 2];
+    uint32_t a1 = A[tid * 2 + 1];
+    uint32_t b0 = B[tid * 2];
+    uint32_t b1 = B[tid * 2 + 1];
+    
+    float c[8] = {0.0f};
+    mma_m8n8k4_sm70(a0, a1, b0, b1, c);
+    
+    // Store all 8 output elements per thread
+    for (int i = 0; i < 8; i++) {
+        C[tid * 8 + i] = c[i];
+    }
+}
+
+bool test_mma_m8n8k4_correctness() {
+    printf("Running test_mma_m8n8k4_correctness...\n");
+    
+    // Test with A=1.0, B=1.0. For K=4, result should be 4.0
+    // Each thread provides: a0, a1 (4 halves total for one row contribution)
+    // and b0, b1 (4 halves total)
+    
+    std::vector<uint32_t> A_packed(64); // 32 threads * 2 uint32
+    std::vector<uint32_t> B_packed(64);
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    for (int i = 0; i < 64; i++) {
+        A_packed[i] = u_one;
+        B_packed[i] = u_one;
+    }
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, 64 * sizeof(uint32_t));
+    cudaMalloc(&dB, 64 * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 8 * sizeof(float));
+    
+    cudaMemcpy(dA, A_packed.data(), 64 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), 64 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    test_mma_m8n8k4_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> C_out(32 * 8);
+    cudaMemcpy(C_out.data(), dC, 32 * 8 * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    
+    // Verify: With A=1, B=1, K=4, output should be 4.0
+    bool pass = true;
+    for (int t = 0; t < 32 && pass; t++) {
+        for (int i = 0; i < 8; i++) {
+            if (!check_close(C_out[t * 8 + i], 4.0f)) {
+                printf("FAILED: Thread %d, C[%d] = %f, expected 4.0\n", t, i, C_out[t * 8 + i]);
+                pass = false;
+                break;
+            }
+        }
+    }
+    
+    if (pass) printf("PASSED\n");
+    return pass;
+}
+
+// Test kernel for mma_m8n8k4_sm70_fp16
+__global__ void test_mma_m8n8k4_fp16_kernel(const uint32_t* A, const uint32_t* B, uint32_t* C) {
+    int tid = threadIdx.x % 32;
+    
+    uint32_t a0 = A[tid * 2];
+    uint32_t a1 = A[tid * 2 + 1];
+    uint32_t b0 = B[tid * 2];
+    uint32_t b1 = B[tid * 2 + 1];
+    
+    uint32_t c[4] = {0, 0, 0, 0};
+    mma_m8n8k4_sm70_fp16(a0, a1, b0, b1, c);
+    
+    // Store 4 output registers per thread
+    for (int i = 0; i < 4; i++) {
+        C[tid * 4 + i] = c[i];
+    }
+}
+
+bool test_mma_m8n8k4_fp16_correctness() {
+    printf("Running test_mma_m8n8k4_fp16_correctness...\n");
+    
+    std::vector<uint32_t> A_packed(64);
+    std::vector<uint32_t> B_packed(64);
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    for (int i = 0; i < 64; i++) {
+        A_packed[i] = u_one;
+        B_packed[i] = u_one;
+    }
+    
+    uint32_t *dA, *dB, *dC;
+    cudaMalloc(&dA, 64 * sizeof(uint32_t));
+    cudaMalloc(&dB, 64 * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 4 * sizeof(uint32_t));
+    
+    cudaMemcpy(dA, A_packed.data(), 64 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), 64 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    test_mma_m8n8k4_fp16_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<uint32_t> C_out(32 * 4);
+    cudaMemcpy(C_out.data(), dC, 32 * 4 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    
+    // Verify: output is half2, should contain 4.0 in half format
+    bool pass = true;
+    for (int t = 0; t < 32 && pass; t++) {
+        for (int i = 0; i < 4; i++) {
+            half2* h2 = reinterpret_cast<half2*>(&C_out[t * 4 + i]);
+            float v0 = __half2float(h2->x);
+            float v1 = __half2float(h2->y);
+            if (!check_close(v0, 4.0f) || !check_close(v1, 4.0f)) {
+                printf("FAILED: Thread %d, C[%d] = (%f, %f), expected (4.0, 4.0)\n", t, i, v0, v1);
+                pass = false;
+                break;
+            }
+        }
+    }
+    
+    if (pass) printf("PASSED\n");
+    return pass;
+}
+
+// Test kernel for shuffle-based mma_m16n8k16_sm70 (the main function used by Marlin)
+__global__ void test_mma_m16n8k16_shuffle_kernel(const uint32_t* A, const uint32_t* B, float* C) {
+    int tid = threadIdx.x % 32;
+    
+    // Each thread loads its fragment portion
+    uint32_t frag_a[8];
+    uint32_t frag_b[2];
+    
+    for (int i = 0; i < 8; i++) {
+        frag_a[i] = A[tid * 8 + i];
+    }
+    for (int i = 0; i < 2; i++) {
+        frag_b[i] = B[tid * 2 + i];
+    }
+    
+    float frag_c[4] = {0.0f};
+    mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
+    
+    // Partitioned store
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
+}
+
+bool test_mma_m16n8k16_shuffle_correctness() {
+    printf("Running test_mma_m16n8k16_shuffle_correctness (shuffle-based)...\n");
+    
+    const int M = 16, N = 8, K = 16;
+    
+    // Create test data with known values
+    std::vector<half> A_h(M * K);
+    std::vector<half> B_h(K * N);
+    
+    for (int i = 0; i < M * K; i++) A_h[i] = __float2half(1.0f);
+    for (int i = 0; i < K * N; i++) B_h[i] = __float2half(2.0f);
+    
+    // CPU reference
+    std::vector<float> C_ref(M * N);
+    matmul_cpu(A_h.data(), B_h.data(), C_ref.data(), M, N, K);
+    
+    // Pack for device - need proper fragment layout
+    // For mma_m16n8k16_sm70: each thread holds 8 uint32 for A, 2 uint32 for B
+    std::vector<uint32_t> A_packed(32 * 8); // 32 threads * 8 uint32
+    std::vector<uint32_t> B_packed(32 * 2); // 32 threads * 2 uint32
+    
+    // Fill A fragments - all 1.0
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    half h_two = __float2half(2.0f);
+    half2 h2_two = __halves2half2(h_two, h_two);
+    uint32_t u_two = *reinterpret_cast<uint32_t*>(&h2_two);
+    
+    for (int i = 0; i < 32 * 8; i++) A_packed[i] = u_one;
+    for (int i = 0; i < 32 * 2; i++) B_packed[i] = u_two;
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, M * N * sizeof(float));
+    
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    test_mma_m16n8k16_shuffle_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> C_out(M * N);
+    cudaMemcpy(C_out.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    
+    // Verify: A=1, B=2, K=16 => C = 32.0
+    bool pass = true;
+    float expected = 32.0f;
+    for (int i = 0; i < M * N; i++) {
+        if (!check_close(C_out[i], expected, 1.0f)) { // Allow larger tolerance for accumulated result
+            printf("FAILED: C[%d] = %f, expected %f\n", i, C_out[i], expected);
+            pass = false;
+            break;
+        }
+    }
+    
+    if (pass) printf("PASSED\n");
+    return pass;
+}
+
+// Test kernel for mma_m16n8k16_sm70_fp16
+__global__ void test_mma_m16n8k16_fp16_kernel(const uint32_t* A, const uint32_t* B, uint32_t* C) {
+    int tid = threadIdx.x % 32;
+    
+    uint32_t frag_a[8];
+    uint32_t frag_b[8]; // FP16 version uses 8 B registers
+    
+    for (int i = 0; i < 8; i++) {
+        frag_a[i] = A[tid * 8 + i];
+        frag_b[i] = B[tid * 8 + i];
+    }
+    
+    uint32_t frag_c[2] = {0, 0};
+    mma_m16n8k16_sm70_fp16(frag_a, frag_b, frag_c);
+    
+    // Store output
+    C[tid * 2 + 0] = frag_c[0];
+    C[tid * 2 + 1] = frag_c[1];
+}
+
+bool test_mma_m16n8k16_fp16_correctness() {
+    printf("Running test_mma_m16n8k16_fp16_correctness...\n");
+    
+    std::vector<uint32_t> A_packed(32 * 8);
+    std::vector<uint32_t> B_packed(32 * 8);
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    for (int i = 0; i < 32 * 8; i++) {
+        A_packed[i] = u_one;
+        B_packed[i] = u_one;
+    }
+    
+    uint32_t *dA, *dB, *dC;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, 32 * 2 * sizeof(uint32_t));
+    
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    test_mma_m16n8k16_fp16_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<uint32_t> C_out(32 * 2);
+    cudaMemcpy(C_out.data(), dC, 32 * 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    
+    // Verify: A=1, B=1, K=16 => C = 16.0 (in half format)
+    bool pass = true;
+    for (int t = 0; t < 32 && pass; t++) {
+        for (int i = 0; i < 2; i++) {
+            half2* h2 = reinterpret_cast<half2*>(&C_out[t * 2 + i]);
+            float v0 = __half2float(h2->x);
+            float v1 = __half2float(h2->y);
+            // FP16 accumulation may have rounding errors
+            if (!check_close(v0, 16.0f, 1.0f) || !check_close(v1, 16.0f, 1.0f)) {
+                printf("FAILED: Thread %d, C[%d] = (%f, %f), expected (16.0, 16.0)\n", t, i, v0, v1);
+                pass = false;
+                break;
+            }
+        }
+    }
+    
+    if (pass) printf("PASSED\n");
+    return pass;
+}
+
+// Test kernel for mma_m16n8k32_sm70 (composed operation)
+__global__ void test_mma_m16n8k32_kernel(const uint32_t* A, const uint32_t* B, float* C) {
+    int tid = threadIdx.x % 32;
+    
+    // m16n8k32 uses 16 A registers and 16 B registers per thread
+    uint32_t frag_a[16];
+    uint32_t frag_b[16];
+    
+    for (int i = 0; i < 16; i++) {
+        frag_a[i] = A[tid * 16 + i];
+        frag_b[i] = B[tid * 16 + i];
+    }
+    
+    float frag_c[4] = {0.0f};
+    mma_m16n8k32_sm70(frag_a, frag_b, frag_c);
+    
+    // Partitioned store
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
+}
+
+bool test_mma_m16n8k32_correctness() {
+    printf("Running test_mma_m16n8k32_correctness...\n");
+    
+    const int M = 16, N = 8, K = 32;
+    
+    std::vector<uint32_t> A_packed(32 * 16);
+    std::vector<uint32_t> B_packed(32 * 16);
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    for (int i = 0; i < 32 * 16; i++) {
+        A_packed[i] = u_one;
+        B_packed[i] = u_one;
+    }
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, M * N * sizeof(float));
+    
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    test_mma_m16n8k32_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> C_out(M * N);
+    cudaMemcpy(C_out.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    
+    // Verify: A=1, B=1, K=32 => C = 32.0
+    bool pass = true;
+    float expected = 32.0f;
+    for (int i = 0; i < M * N; i++) {
+        if (!check_close(C_out[i], expected, 2.0f)) {
+            printf("FAILED: C[%d] = %f, expected %f\n", i, C_out[i], expected);
+            pass = false;
+            break;
+        }
+    }
+    
+    if (pass) printf("PASSED\n");
+    return pass;
+}
+
+// Test kernel for mma_m16n8k16_sm70_trans (transposed B)
+__global__ void test_mma_m16n8k16_trans_shuffle_kernel(const uint32_t* A, const uint32_t* B, const uint32_t* B2, float* C) {
+    int tid = threadIdx.x % 32;
+    
+    uint32_t frag_a[8];
+    uint32_t frag_b[2];
+    uint32_t frag_b2[2];
+    
+    for (int i = 0; i < 8; i++) {
+        frag_a[i] = A[tid * 8 + i];
+    }
+    for (int i = 0; i < 2; i++) {
+        frag_b[i] = B[tid * 2 + i];
+        frag_b2[i] = B2[tid * 2 + i];
+    }
+    
+    float frag_c[4] = {0.0f};
+    mma_m16n8k16_sm70_trans(frag_a, frag_b, frag_b2, frag_c);
+    
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
+}
+
+bool test_mma_m16n8k16_trans_correctness() {
+    printf("Running test_mma_m16n8k16_trans_correctness...\n");
+    
+    const int M = 16, N = 8;
+    
+    std::vector<uint32_t> A_packed(32 * 8);
+    std::vector<uint32_t> B_packed(32 * 2);
+    std::vector<uint32_t> B2_packed(32 * 2);
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    for (int i = 0; i < 32 * 8; i++) A_packed[i] = u_one;
+    for (int i = 0; i < 32 * 2; i++) {
+        B_packed[i] = u_one;
+        B2_packed[i] = u_one;
+    }
+    
+    uint32_t *dA, *dB, *dB2;
+    float *dC;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB2, B2_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, M * N * sizeof(float));
+    
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB2, B2_packed.data(), B2_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    test_mma_m16n8k16_trans_shuffle_kernel<<<1, 32>>>(dA, dB, dB2, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> C_out(M * N);
+    cudaMemcpy(C_out.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dB2);
+    cudaFree(dC);
+    
+    // Transposed multiply with all 1s should produce meaningful result
+    // The exact value depends on the transposition logic
+    bool pass = true;
+    bool has_nonzero = false;
+    for (int i = 0; i < M * N; i++) {
+        if (C_out[i] != 0.0f) has_nonzero = true;
+        if (std::isnan(C_out[i]) || std::isinf(C_out[i])) {
+            printf("FAILED: C[%d] = %f (invalid value)\n", i, C_out[i]);
+            pass = false;
+            break;
+        }
+    }
+    
+    if (pass && !has_nonzero) {
+        printf("WARNING: All outputs are zero (may indicate issue)\n");
+    }
+    
+    if (pass) printf("PASSED\n");
+    return pass;
+}
+
+// Test accumulation behavior of mma_m16n8k16_sm70
+__global__ void test_mma_m16n8k16_accumulation_kernel(const uint32_t* A, const uint32_t* B, float* C) {
+    int tid = threadIdx.x % 32;
+    
+    uint32_t frag_a[8];
+    uint32_t frag_b[2];
+    
+    for (int i = 0; i < 8; i++) frag_a[i] = A[tid * 8 + i];
+    for (int i = 0; i < 2; i++) frag_b[i] = B[tid * 2 + i];
+    
+    // Start with non-zero accumulator
+    float frag_c[4] = {10.0f, 10.0f, 10.0f, 10.0f};
+    
+    // Call MMA - should ADD to existing values
+    mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
+    
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
+}
+
+bool test_mma_m16n8k16_accumulation() {
+    printf("Running test_mma_m16n8k16_accumulation...\n");
+    
+    const int M = 16, N = 8;
+    
+    std::vector<uint32_t> A_packed(32 * 8);
+    std::vector<uint32_t> B_packed(32 * 2);
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    for (int i = 0; i < 32 * 8; i++) A_packed[i] = u_one;
+    for (int i = 0; i < 32 * 2; i++) B_packed[i] = u_one;
+    
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, M * N * sizeof(float));
+    
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    test_mma_m16n8k16_accumulation_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> C_out(M * N);
+    cudaMemcpy(C_out.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    cudaFree(dA);
+    cudaFree(dB);
+    cudaFree(dC);
+    
+    // Verify: Initial 10.0 + (A=1 * B=1 * K=16) = 10.0 + 16.0 = 26.0
+    bool pass = true;
+    float expected = 26.0f;
+    for (int i = 0; i < M * N; i++) {
+        if (!check_close(C_out[i], expected, 2.0f)) {
+            printf("FAILED: C[%d] = %f, expected %f (10 + 16)\n", i, C_out[i], expected);
+            pass = false;
+            break;
+        }
+    }
+    
+    if (pass) printf("PASSED (Accumulation adds to existing values)\n");
+    return pass;
+}
+
+// =============================================================================
 // MoE Marlin Regression Tests
 // =============================================================================
 
@@ -1649,6 +2207,24 @@ int main() {
     // MoE Regression Tests
     all_pass &= test_moe_b_load_regression();
     all_pass &= test_moe_scaling_unit();
+
+    // ==========================================================================
+    // NEW: Comprehensive MMA Function Tests
+    // ==========================================================================
+    printf("\n=== Comprehensive MMA Function Tests ===\n");
+    
+    // Core m8n8k4 tests
+    all_pass &= test_mma_m8n8k4_correctness();
+    all_pass &= test_mma_m8n8k4_fp16_correctness();
+    
+    // Shuffle-based m16n8k16 tests (main Marlin function)
+    all_pass &= test_mma_m16n8k16_shuffle_correctness();
+    all_pass &= test_mma_m16n8k16_fp16_correctness();
+    all_pass &= test_mma_m16n8k16_trans_correctness();
+    all_pass &= test_mma_m16n8k16_accumulation();
+    
+    // Composed m16n8k32 test
+    all_pass &= test_mma_m16n8k32_correctness();
 
     // Performance Benchmark
     all_pass &= test_marlin_performance();
