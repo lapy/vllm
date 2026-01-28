@@ -756,7 +756,7 @@ __global__ void Marlin(
   b_gl_rd += B_expert_off + b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
   int b_sh_rd = (int)threadIdx.x * b_thread_vecs;
-  b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
+  b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * ((int)b_sh_wr_iters - 1));
 
   // For act_order
   int slice_k_start = tb_k * slice_row;
