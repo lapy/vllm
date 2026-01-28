@@ -349,13 +349,21 @@ __global__ void test_ldmatrix_strict_pattern_kernel(uint32_t* output) {
     __shared__ uint32_t smem[32 * 4];
     int tid = threadIdx.x % 32;
     
-    // Fill with pattern: row*1000 + col
-    // This allows us to trace exactly where each value came from
-    // row = tid (simplified 1-1 mapping for init)
+    // Fill with pattern matching the expected input layout for ldmatrix_x4 + mma_m16n8k16
+    // Threads 0-7: Rows 0-7
+    // Threads 8-15: Rows 0-7 (redundant copies for mma)
+    // Threads 16-23: Rows 8-15
+    // Threads 24-31: Rows 8-15 (redundant copies)
+    
+    int group = tid / 8;
+    int lane_in_group = tid % 8;
+    int row_id = lane_in_group + (group >= 2 ? 8 : 0);
+    
     for(int c=0; c<4; c++) {
          // Pack halves
-         half h0 = __float2half((float)(tid * 1000 + c * 2));
-         half h1 = __float2half((float)(tid * 1000 + c * 2 + 1));
+         // Use row_id to simulate the matrix row content
+         half h0 = __float2half((float)(row_id * 1000 + c * 2));
+         half h1 = __float2half((float)(row_id * 1000 + c * 2 + 1));
          half2 packed = __halves2half2(h0, h1);
          smem[tid * 4 + c] = *reinterpret_cast<uint32_t*>(&packed);
     }
