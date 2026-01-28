@@ -123,103 +123,56 @@ bool test_checkerboard_integrity() {
     return true;
 }
 
-    // Expected Result:
-    // Since A is all 1s, C[row][col] = K/2 * 1.0 = 8.0 (if sum touches 8 ones and 8 zeros)
-    // Actually, dot product of [1,1,1...] and [1,0,1,0...] is 8.
-    // If padding leaks, we might get interference from adjacent rows/columns ?? 
-    // Wait, padding extends K from 16 to 16 (no pad) or N from 8 to 16 (pad with 0).
-    // If N-padding is broken (cols 8-15 contain garbage), it shouldn't affect cols 0-7 unless
-    // the MMA operation wraps or reads out of bounds.
-    // A better text for padding leakage is to have huge values in the "garbage" zone if we could control it.
-    // But here we rely on mma_direct to do the padding.
-    
-    // CPU Ref
-    std::vector<float> C_ref(M*N);
-    for(int m=0; m<M; m++) {
-        for(int n=0; n<N; n++) {
-            float sum = 0;
-            for(int k=0; k<K; k++) {
-                 sum += __half2float(A_ref[m*K+k]) * __half2float(B_ref[k*N+n]);
-            }
-            C_ref[m*N+n] = sum;
-        }
-    }
-
-    uint32_t *dA, *dB; float *dC;
-    cudaMalloc(&dA, M*K*2); cudaMalloc(&dB, K*N*2); cudaMalloc(&dC, M*N*4);
-
-    std::vector<uint32_t> A_packed(M*K/2), B_packed(K*N/2);
-    pack_halves(A_packed.data(), A_ref.data(), M*K/2);
-    pack_halves(B_packed.data(), B_ref.data(), K*N/2);
-
-    cudaMemcpy(dA, A_packed.data(), A_packed.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B_packed.data(), B_packed.size()*4, cudaMemcpyHostToDevice);
-
-    checkerboard_torture_kernel<<<1, 32>>>(dA, dB, dC);
-
-    std::vector<float> C_out(M*N);
-    cudaMemcpy(C_out.data(), dC, M*N*4, cudaMemcpyDeviceToHost);
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-
-    float max_err = 0;
-    for(int i=0; i<M*N; i++) {
-        if(abs(C_out[i] - C_ref[i]) > max_err) max_err = abs(C_out[i] - C_ref[i]);
-    }
-    
-    if(max_err > 0.05f) {
-        printf("FAILED: Checkerboard pattern leaked! Max err: %f\n", max_err);
-        return false;
-    }
-    printf("PASSED (Checkerboard integrity verified)\n");
-    return true;
-}
-
 // -----------------------------------------------------------------------------
 // Test 2: Nan/Inf Handling
 // -----------------------------------------------------------------------------
 bool test_nan_inf_stability() {
-    printf("Running NaN/Inf Stability Test...\n");
-    // If ANY input is NaN, result should be NaN.
-    // If Inputs are clean, result must not be NaN.
-    const int M=16, N=8, K=16;
+    printf("Running NaN/Inf Stability Test (shuffle-based MMA)...\n");
+    const int M = 16, N = 8;
     
-    std::vector<half> A_ref(M*K, __float2half(1.0f));
-    std::vector<half> B_ref(K*N, __float2half(1.0f));
+    std::vector<uint32_t> A_packed(32 * 8);
+    std::vector<uint32_t> B_packed(32 * 2);
     
-    // Inject a NaN
-    A_ref[0] = __float2half(NAN);
+    // Fill with 1.0s first
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
     
-    uint32_t *dA, *dB; float *dC;
-    cudaMalloc(&dA, M*K*2); cudaMalloc(&dB, K*N*2); cudaMalloc(&dC, M*N*4);
+    for (size_t i = 0; i < A_packed.size(); i++) A_packed[i] = u_one;
+    for (size_t i = 0; i < B_packed.size(); i++) B_packed[i] = u_one;
     
-    std::vector<uint32_t> A_packed(M*K/2), B_packed(K*N/2);
-    pack_halves(A_packed.data(), A_ref.data(), M*K/2);
-    pack_halves(B_packed.data(), B_ref.data(), K*N/2);
+    // Inject NaN into A
+    half h_nan = __float2half(NAN);
+    half2 h2_nan = __halves2half2(h_nan, h_one);
+    A_packed[0] = *reinterpret_cast<uint32_t*>(&h2_nan);
     
-    cudaMemcpy(dA, A_packed.data(), A_packed.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B_packed.data(), B_packed.size()*4, cudaMemcpyHostToDevice);
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, M * N * sizeof(float));
     
-    checkerboard_torture_kernel<<<1, 32>>>(dA, dB, dC); // Reuse kernel structure
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
     
-    std::vector<float> C_out(M*N);
-    cudaMemcpy(C_out.data(), dC, M*N*4, cudaMemcpyDeviceToHost);
+    mma_torture_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> C_out(M * N);
+    cudaMemcpy(C_out.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
     
-    // Check results. Row 0 should be NaN. Others should be valid.
     int nan_count = 0;
     int valid_count = 0;
-    for(int i=0; i<M*N; i++) {
-        if(std::isnan(C_out[i])) nan_count++;
+    for (int i = 0; i < M * N; i++) {
+        if (std::isnan(C_out[i])) nan_count++;
         else valid_count++;
     }
     
-    // Row 0 has 8 elements. All should be NaN ideally, or at least some.
-    // SM70 Tensor Cores propagate NaNs ? Yes they should.
     printf("  NaN Count: %d, Valid Count: %d\n", nan_count, valid_count);
     
-    if(nan_count == 0) {
-        printf("WARNING: NaN was swallowed! (Strictly speaking, fast-math might do this, but checking)\n");
-        // Not a hard fail for quantization kernels usually, but good to know.
+    if (nan_count == 0) {
+        printf("WARNING: NaN was swallowed! (fast-math might do this)\n");
     }
     
     return true;
@@ -284,46 +237,50 @@ bool test_race_conditions() {
 // This requires FP32 accumulation. If the kernel uses FP16 internally, 
 // it will hit Infinity or saturate at 65504.
 bool test_fp32_saturation() {
-    printf("Running FP32 Saturation Test (Checking accumulator width)...\n");
-    const int M=16, N=8, K=16;
+    printf("Running FP32 Saturation Test (shuffle-based MMA)...\n");
+    const int M = 16, N = 8;
     
-    // 300.0 is representable in FP16 (exact).
-    std::vector<half> A_ref(M*K, __float2half(300.0f));
-    std::vector<half> B_ref(K*N, __float2half(300.0f));
+    std::vector<uint32_t> A_packed(32 * 8);
+    std::vector<uint32_t> B_packed(32 * 2);
     
-    uint32_t *dA, *dB; float *dC;
-    cudaMalloc(&dA, M*K*2); cudaMalloc(&dB, K*N*2); cudaMalloc(&dC, M*N*4);
+    // 300.0 is representable in FP16 (exact)
+    half h_300 = __float2half(300.0f);
+    half2 h2_300 = __halves2half2(h_300, h_300);
+    uint32_t u_300 = *reinterpret_cast<uint32_t*>(&h2_300);
     
-    std::vector<uint32_t> A_packed(M*K/2), B_packed(K*N/2);
-    pack_halves(A_packed.data(), A_ref.data(), M*K/2);
-    pack_halves(B_packed.data(), B_ref.data(), K*N/2);
+    for (size_t i = 0; i < A_packed.size(); i++) A_packed[i] = u_300;
+    for (size_t i = 0; i < B_packed.size(); i++) B_packed[i] = u_300;
     
-    cudaMemcpy(dA, A_packed.data(), A_packed.size()*4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B_packed.data(), B_packed.size()*4, cudaMemcpyHostToDevice);
+    uint32_t *dA, *dB;
+    float *dC;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, M * N * sizeof(float));
     
-    // Reuse checkerboard kernel logic as it just does a standard MMA
-    // checkerboard_torture_kernel is just a wrapper around mma_direct
-    checkerboard_torture_kernel<<<1, 32>>>(dA, dB, dC);
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
     
-    std::vector<float> C_out(M*N);
-    cudaMemcpy(C_out.data(), dC, M*N*4, cudaMemcpyDeviceToHost);
+    mma_torture_kernel<<<1, 32>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<float> C_out(M * N);
+    cudaMemcpy(C_out.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
     
     float expected = 300.0f * 300.0f * 16.0f; // 1,440,000.0
     float max_err = 0.0f;
     
-    // Check first element
     if (std::isinf(C_out[0])) {
-         printf("FAILED: Result is Infinity! Accumulator is likely FP16.\n");
-         return false;
+        printf("FAILED: Result is Infinity! Accumulator is likely FP16.\n");
+        return false;
     }
     
-    for(int i=0; i<M*N; i++) {
-        if(abs(C_out[i] - expected) > max_err) max_err = abs(C_out[i] - expected);
+    for (int i = 0; i < M * N; i++) {
+        if (std::abs(C_out[i] - expected) > max_err) max_err = std::abs(C_out[i] - expected);
     }
     
-    printf("  Expected: %f, Got (avg): %f\n", expected, C_out[0]);
-    if(max_err > 1.0f) {
+    printf("  Expected: %f, Got: %f\n", expected, C_out[0]);
+    if (max_err > 1.0f) {
         printf("FAILED: Large error %f. Precision loss or overflow detected.\n", max_err);
         return false;
     }
@@ -521,32 +478,38 @@ bool test_multi_block_concurrent() {
 // Test 7: Denormalized Number Handling
 // -----------------------------------------------------------------------------
 bool test_denormalized_numbers() {
-    printf("Running Denormalized Number Handling Test...\n");
-    const int M = 16, N = 8, K = 16;
+    printf("Running Denormalized Number Handling Test (shuffle-based MMA)...\n");
+    const int M = 16, N = 8;
+    
+    std::vector<uint32_t> A_packed(32 * 8);
+    std::vector<uint32_t> B_packed(32 * 2);
     
     // FP16 minimum normalized: ~6.1e-5, denormals go smaller
-    std::vector<half> A_ref(M * K, __float2half(1e-7f)); // Very small
-    std::vector<half> B_ref(K * N, __float2half(1e7f));  // Very large
-    // Product should be ~1.0 per element, sum ~16.0
+    // Very small * Very large should give ~1.0 per element
+    half h_small = __float2half(1e-7f);
+    half h_large = __float2half(1e7f);
+    half2 h2_small = __halves2half2(h_small, h_small);
+    half2 h2_large = __halves2half2(h_large, h_large);
+    uint32_t u_small = *reinterpret_cast<uint32_t*>(&h2_small);
+    uint32_t u_large = *reinterpret_cast<uint32_t*>(&h2_large);
+    
+    for (size_t i = 0; i < A_packed.size(); i++) A_packed[i] = u_small;
+    for (size_t i = 0; i < B_packed.size(); i++) B_packed[i] = u_large;
     
     uint32_t *dA, *dB;
     float *dC;
-    cudaMalloc(&dA, M * K * 2);
-    cudaMalloc(&dB, K * N * 2);
-    cudaMalloc(&dC, M * N * 4);
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dC, M * N * sizeof(float));
     
-    std::vector<uint32_t> A_packed(M * K / 2), B_packed(K * N / 2);
-    pack_halves(A_packed.data(), A_ref.data(), M * K / 2);
-    pack_halves(B_packed.data(), B_ref.data(), K * N / 2);
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
     
-    cudaMemcpy(dA, A_packed.data(), A_packed.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B_packed.data(), B_packed.size() * 4, cudaMemcpyHostToDevice);
-    
-    checkerboard_torture_kernel<<<1, 32>>>(dA, dB, dC);
+    mma_torture_kernel<<<1, 32>>>(dA, dB, dC);
     CUDA_CHECK(cudaGetLastError());
     
     std::vector<float> C_out(M * N);
-    cudaMemcpy(C_out.data(), dC, M * N * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(C_out.data(), dC, M * N * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
     
     // Check for NaN/Inf
@@ -575,11 +538,8 @@ bool test_denormalized_numbers() {
 // Test 8: Maximum Shared Memory Pressure
 // -----------------------------------------------------------------------------
 // Tests behavior when shared memory is heavily used
-__global__ void max_smem_pressure_kernel(float* out) {
-    // Allocate shared memory that fits within SM70 48KB limit
-    // mma_m16n8k16_sm70_direct uses ~12KB internally (8 warps * 1.5KB)
-    // sh_a: 512 bytes, sh_b: 256 bytes
-    // Total available: ~35KB for big_smem
+__global__ void max_smem_pressure_kernel(const uint32_t* A_frag, const uint32_t* B_frag, float* out) {
+    // Allocate shared memory to stress the system
     constexpr int BIG_SMEM_SIZE = 32 * 1024; // 32KB
     __shared__ char big_smem[BIG_SMEM_SIZE];
     
@@ -591,29 +551,24 @@ __global__ void max_smem_pressure_kernel(float* out) {
     }
     __syncthreads();
     
-    // Now run MMA which also uses shared memory internally
-    __shared__ half sh_a[16 * 16];
-    __shared__ half sh_b[16 * 8];
-    
-    if (tid < 256) {
-        sh_a[tid] = __float2half(1.0f);
-    }
-    if (tid < 128) {
-        sh_b[tid] = __float2half(1.0f);
-    }
-    __syncthreads();
-    
+    // Run shuffle-based MMA (no shared memory internally)
     float frag_c[4] = {0.0f};
     if (tid < 32) {
-        mma_m16n8k16_sm70_direct(sh_a, sh_b, frag_c);
+        uint32_t frag_a[8];
+        uint32_t frag_b[2];
+        
+        for (int i = 0; i < 8; i++) frag_a[i] = A_frag[tid * 8 + i];
+        for (int i = 0; i < 2; i++) frag_b[i] = B_frag[tid * 2 + i];
+        
+        mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
     }
     __syncthreads();
     
     // Verify big_smem wasn't corrupted
-    int errors = 0;
+    int local_errors = 0;
     for (int i = tid; i < BIG_SMEM_SIZE; i += blockDim.x) {
         if (big_smem[i] != (char)(i & 0xFF)) {
-            errors++;
+            local_errors++;
         }
     }
     
@@ -621,7 +576,7 @@ __global__ void max_smem_pressure_kernel(float* out) {
     __shared__ int error_count;
     if (tid == 0) error_count = 0;
     __syncthreads();
-    atomicAdd(&error_count, errors);
+    atomicAdd(&error_count, local_errors);
     __syncthreads();
     
     if (tid == 0) {
@@ -631,18 +586,35 @@ __global__ void max_smem_pressure_kernel(float* out) {
 }
 
 bool test_max_smem_pressure() {
-    printf("Running Maximum Shared Memory Pressure Test...\n");
+    printf("Running Maximum Shared Memory Pressure Test (shuffle-based MMA)...\n");
     
+    // Prepare fragments
+    std::vector<uint32_t> A_packed(32 * 8);
+    std::vector<uint32_t> B_packed(32 * 2);
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    for (size_t i = 0; i < A_packed.size(); i++) A_packed[i] = u_one;
+    for (size_t i = 0; i < B_packed.size(); i++) B_packed[i] = u_one;
+    
+    uint32_t *dA, *dB;
     float *d_out;
+    cudaMalloc(&dA, A_packed.size() * sizeof(uint32_t));
+    cudaMalloc(&dB, B_packed.size() * sizeof(uint32_t));
     cudaMalloc(&d_out, 8);
     
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
     // Use 256 threads
-    max_smem_pressure_kernel<<<1, 256>>>(d_out);
+    max_smem_pressure_kernel<<<1, 256>>>(dA, dB, d_out);
     cudaError_t err = cudaGetLastError();
     
     if (err != cudaSuccess) {
         printf("SKIPPED: Kernel launch failed (likely insufficient smem): %s\n", cudaGetErrorString(err));
-        cudaFree(d_out);
+        cudaFree(dA); cudaFree(dB); cudaFree(d_out);
         return true; // Not a failure, just resource limitation
     }
     
@@ -650,7 +622,7 @@ bool test_max_smem_pressure() {
     
     float h_out[2];
     cudaMemcpy(h_out, d_out, 8, cudaMemcpyDeviceToHost);
-    cudaFree(d_out);
+    cudaFree(dA); cudaFree(dB); cudaFree(d_out);
     
     if (h_out[0] > 0) {
         printf("FAILED: Shared memory corruption detected (%f errors)\n", h_out[0]);
