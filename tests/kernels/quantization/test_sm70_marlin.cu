@@ -92,10 +92,7 @@ __global__ void test_mma_m16n8k16_kernel(const uint32_t* A, const uint32_t* B, f
     float frag_c[4] = {0.0f};
     mma_m16n8k16_sm70(A + tid * 8, B + tid * 8, frag_c);
     
-    // Store outputs using correct FragC layout for SM70 (16x8 block)
-    int core_row = (tid % 8);
-    int core_col_base = (tid / 8); 
-    
+    // Partitioned store: Row = tid/4 + {0, 8}, Col = (tid%4)*2 + {0, 1}
     int core_row = tid / 4;
     int core_col = (tid % 4) * 2;
     
@@ -109,9 +106,6 @@ __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t
     int tid = threadIdx.x % 32;
     float frag_c[4] = {0.0f};
     mma_m16n8k16_sm70_trans(A + tid * 8, B + tid * 2, B2 + tid * 2, frag_c);
-    
-    int core_row = (tid % 8);
-    int core_col_base = (tid / 8); 
     
     int core_row = tid / 4;
     int core_col = (tid % 4) * 2;
@@ -202,11 +196,6 @@ __global__ void marlin_simulation_kernel(
     float frag_c[4] = {0.0f};
     mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
     
-    // --- STAGE 4: Store ---
-    // Correct store for FragC layout on SM70 (16x8 block)
-    int core_row = (tid % 8);
-    int core_col_base = (tid / 8); 
-    
     // Partitioned store: Row = tid/4 + {0, 8}, Col = (tid%4)*2 + {0, 1}
     int core_row = tid / 4;
     int core_col = (tid % 4) * 2;
@@ -280,10 +269,6 @@ __global__ void marlin_simulation_looped_kernel(
         
         __syncwarp(); // Barrier before next load overwrites shared
     }
-    
-    // --- STAGE 4: Store ---
-    int core_row = (tid % 8);
-    int core_col_base = (tid / 8); 
     
     // Partitioned store: Row = tid/4 + {0, 8}, Col = (tid%4)*2 + {0, 1}
     int core_row = tid / 4;
@@ -374,9 +359,6 @@ __global__ void marlin_simulation_dequant_kernel(
 
     float frag_c[4] = {0.0f};
     mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
-    
-    int core_row = (tid % 8);
-    int core_col_base = (tid / 8); 
     
     // Partitioned store: Row = tid/4 + {0, 8}, Col = (tid%4)*2 + {0, 1}
     int core_row = tid / 4;
