@@ -354,9 +354,6 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
     float c[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
     float dummy[2];
 
-    float c[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
-    float dummy[2];
-
     // Step 0: K0..3
     {
         half2 a_top = *reinterpret_cast<const half2*>(&A[0]);
@@ -385,7 +382,6 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
 
         half2 a_use_top = __halves2half2(a_top.y, a_top.y);
         half2 a_use_bot = __halves2half2(a_bot.y, a_bot.y);
-        half2 b_use     = __halves2half2(b_tr_y.x, b_tr_y.x); // Wait, b_tr.y? No.
         // b_tr_y contains "K4..7" equivalent data constructed from high bits.
         // It has 2 halves. We need to use them in 2 mma ops? 
         // No, `mma_m8n8k4` needs 4 input B data.
