@@ -1294,19 +1294,6 @@ __global__ void __launch_bounds__(threads) Marlin(
       dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
       dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-      // Each int4 in frag_b_quant has 4 ints. Each int dequantizes to 2 half2 (4 halves).
-      // Total 4 * 2 = 8 half2 = 16 halves = 16 K-steps.
-      // Matches FragB size 8 and mma_m16n8k16_sm70 requirements.
-      int* b_q_ptr = reinterpret_cast<int*>(&frag_b_quant[k2][0]);
-      
-      dequant_data(b_q_ptr[0], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 0);
-      dequant_data(b_q_ptr[1], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 2);
-      dequant_data(b_q_ptr[2], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 0);
-      dequant_data(b_q_ptr[3], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 2);
-#endif
-
-
       if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
         sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);
         sub_zp<a_type_id>(frag_b1, frag_zp[j], 1);

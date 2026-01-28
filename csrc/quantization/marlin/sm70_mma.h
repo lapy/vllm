@@ -208,75 +208,58 @@ __device__ __forceinline__ void mma_m8n8k4_sm70_fp16(
 
 
 // =============================================================================
-// WMMA-based mma_m16n8k16 for Volta (SM70)
-// Uses nvcuda::wmma (m16n16k16) with shared memory reconstruction.
-// Results extracted into Marlin layout: 4 floats per thread.
+// Shuffle-based mma_m16n8k16 for Volta (SM70) with FP32 accumulation
+// Uses warp shuffles to distribute A and B fragments, avoiding shared memory.
+// Composes 4x mma.m8n8k4 to achieve m16n8k16.
+//
+// On SM70, FragB has the same size as other architectures (Vec<half2, 2> = 4 halves).
+// The B data is distributed across threads in the warp via shuffles to provide
+// the full k=16 dimension needed for the computation.
 // =============================================================================
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
+    const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
-    int wid = (threadIdx.x / 32) % 8; // Support up to 8 warps (256 threads)
-
-    // Use a single flat shared memory pool to ensure strict isolation between warps.
-    // Each warp needs (256 * 2) + (256 * 2) + (256 * 4) = 2KB. 8 warps = 16KB.
-    __shared__ char smem_pool[8 * 2048];
+    int col_pair = tid % 4;
     
-    half* sh_a = reinterpret_cast<half*>(&smem_pool[wid * 2048]);
-    half* sh_b = reinterpret_cast<half*>(&smem_pool[wid * 2048 + 512]);
-    float* sh_c = reinterpret_cast<float*>(&smem_pool[wid * 2048 + 1024]);
-
-    const half* a_halves = reinterpret_cast<const half*>(A);
-
-    int grp = tid / 8;
-    int row = tid % 8;
+    // Initialize accumulator to add to existing frag_c values
+    float c_local[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
     
-    // Matches ldmatrix_m8n8_x4_sm70 logic
-    // Grp 0: Cols 0-3. Grp 1: Cols 8-11. Grp 2: Cols 4-7. Grp 3: Cols 12-15.
-    int col_start = (grp % 2) * 8 + (grp / 2) * 4;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int k_part = (k / 2);
+        // Shuffle A fragments from the appropriate source lanes
+        uint32_t a0_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 0], (tid % 8) + k_part * 8);
+        uint32_t a1_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 1], (tid % 8) + k_part * 8);
+        uint32_t a0_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 4], (tid % 8) + 16 + k_part * 8);
+        uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + k_part * 8);
+        
+        // Shuffle B fragments to get different k-slices from different threads.
+        // Each thread's B[0..1] contains 4 half values. For k=16, we need data
+        // from 4 different "k-groups" of threads.
+        // Source lane = thread in same column but different k-group
+        int b_source = (tid % 8) + k_part * 8;
+        uint32_t b0 = __shfl_sync(FULL_MASK, B[k % 2], b_source);
+        uint32_t b1 = __shfl_sync(FULL_MASK, B[(k % 2) + 1], b_source);
 
-    // Write Top Tile (Row 0-7)
-    sh_a[row * 16 + col_start + 0] = a_halves[0];
-    sh_a[row * 16 + col_start + 1] = a_halves[1];
-    sh_a[row * 16 + col_start + 2] = a_halves[2];
-    sh_a[row * 16 + col_start + 3] = a_halves[3];
+        // Top 8 rows of output (m = 0..7)
+        float c_step_t[8] = {0,0,0,0,0,0,0,0};
+        mma_m8n8k4_sm70(a0_t, a1_t, b0, b1, c_step_t);
+        c_local[0] += c_step_t[col_pair * 2 + 0];
+        c_local[1] += c_step_t[col_pair * 2 + 1];
 
-    // Write Bottom Tile (Row 8-15)
-    sh_a[(row + 8) * 16 + col_start + 0] = a_halves[4];
-    sh_a[(row + 8) * 16 + col_start + 1] = a_halves[5];
-    sh_a[(row + 8) * 16 + col_start + 2] = a_halves[6];
-    sh_a[(row + 8) * 16 + col_start + 3] = a_halves[7];
-
-    const half* b_halves = reinterpret_cast<const half*>(B);
-    int b_col = tid / 4;
-    for (int k = 0; k < 16; k++) {
-        sh_b[k * 16 + b_col] = b_halves[k];
+        // Bottom 8 rows of output (m = 8..15)
+        float c_step_b[8] = {0,0,0,0,0,0,0,0};
+        mma_m8n8k4_sm70(a0_b, a1_b, b0, b1, c_step_b);
+        c_local[2] += c_step_b[col_pair * 2 + 0];
+        c_local[3] += c_step_b[col_pair * 2 + 1];
     }
-    if (tid < 8) {
-        for (int k = 0; k < 16; k++) {
-            sh_b[k * 16 + 8 + tid] = __float2half(0.0f);
-        }
-    }
-
-    __syncthreads();
-
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_acc;
-
-    wmma::fill_fragment(frag_acc, 0.0f);
-    wmma::load_matrix_sync(frag_a, sh_a, 16);
-    wmma::load_matrix_sync(frag_b, sh_b, 16);
-    wmma::mma_sync(frag_acc, frag_a, frag_b, frag_acc);
-    wmma::store_matrix_sync(sh_c, frag_acc, 16, wmma::mem_row_major);
-
-    __syncthreads();
-
-    int marlin_row = tid / 4;
-    int marlin_col = (tid % 4) * 2;
-    frag_c[0] = sh_c[marlin_row * 16 + marlin_col];
-    frag_c[1] = sh_c[marlin_row * 16 + marlin_col + 1];
-    frag_c[2] = sh_c[(marlin_row + 8) * 16 + marlin_col];
-    frag_c[3] = sh_c[(marlin_row + 8) * 16 + marlin_col + 1];
+    
+    // Write back accumulated results
+    frag_c[0] = c_local[0];
+    frag_c[1] = c_local[1];
+    frag_c[2] = c_local[2];
+    frag_c[3] = c_local[3];
 }
 
 __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
