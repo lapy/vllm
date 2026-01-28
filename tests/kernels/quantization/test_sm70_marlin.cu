@@ -475,7 +475,6 @@ bool test_mma_random_numerical() {
     
     // Let's refine:
     // We can just verify that no NaN/Inf and values are non-zero.
-    bool passed = true;
     float max_val = 0.0f;
     for(float f : C_out) {
         if(std::isnan(f) || std::isinf(f)) { 
