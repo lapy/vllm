@@ -270,7 +270,7 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
         half2 a = *reinterpret_cast<const half2*>(&A[0]);
         half2 b = *reinterpret_cast<const half2*>(&B[0]);
         half2 a_top = __halves2half2(a.x, a.x);
-        half2 a_bot = __les2half2(a.y, a.y);
+        half2 a_bot = __halves2half2(a.y, a.y);
         half2 b_use = __halves2half2(b.x, b.x);
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
