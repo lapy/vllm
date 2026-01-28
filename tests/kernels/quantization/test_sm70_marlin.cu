@@ -249,7 +249,8 @@ __global__ void marlin_simulation_looped_kernel(
         uint32_t frag_a[8]; 
         int a_row_off = (tid % 8) + (tid / 16) * 8;
         int a_col_off = ((tid / 8) % 2) * 4;
-        // Total 16 halves per thread column.
+        ldmatrix_m8n8_x4_sm70(&frag_a[0], &sh_a[a_row_off * 8 + a_col_off]);
+        ldmatrix_m8n8_x4_sm70(&frag_a[4], &sh_a[a_row_off * 8 + a_col_off + 4]);
 
         uint32_t frag_b[8];
         half* sh_b_h = reinterpret_cast<half*>(sh_b);
@@ -564,10 +565,9 @@ bool test_mma_random_numerical() {
     // This test is primarily for the MMA instruction itself, assuming correct fragment distribution.
     // The `marlin_simulation_kernel` tests the full pipeline including fragment distribution.
 
-    // Copy first 32*8 uint32s from A_packed to d_A
-    cudaMemcpy(d_A, A_packed.data(), 32*8*sizeof(uint32_t), cudaMemcpyHostToDevice);
-    // Copy first 32*8 uint32s from B_packed to d_B
-    cudaMemcpy(d_B, B_packed.data(), 32*8*sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // Copy A and B to device
+    cudaMemcpy(d_A, A_packed.data(), A_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B_packed.data(), B_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
     
     marlin_simulation_kernel<<<1, 32>>>(d_A, d_B, d_C);
     CUDA_CHECK(cudaGetLastError());
