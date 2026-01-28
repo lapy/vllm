@@ -68,6 +68,26 @@ where `scale_factor * multiplier` can be computed at weight loading.
 namespace MARLIN_NAMESPACE_NAME {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+
+// SM70 (Volta) has enlarged FragB (8 elements instead of 2) due to WMMA-based
+// ldmatrix emulation. This helper replicates the standard 2-element dequant
+// output across all 8 elements to match the SM70 MMA data layout requirements.
+// The MMA emulation on SM70 reads all 16 half values from FragB.
+template <typename scalar_t2>
+__device__ inline void replicate_frag_b_for_sm70(
+    [[maybe_unused]] scalar_t2* frag_b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  // Replicate elements 0-1 to fill positions 2-7
+  // This matches the SM70 WMMA fragment layout expectations
+  frag_b[2] = frag_b[0];
+  frag_b[3] = frag_b[1];
+  frag_b[4] = frag_b[0];
+  frag_b[5] = frag_b[1];
+  frag_b[6] = frag_b[0];
+  frag_b[7] = frag_b[1];
+#endif
+}
+
 // Lookup-table based 3-input logical operation; explicitly used for
 // dequantization as the compiler does not seem to automatically recognize it in
 // all cases.
@@ -116,6 +136,7 @@ __device__ inline void dequant<half2, vllm::kU4B8.id(), true>(int q,
 
   frag_b[0] = *reinterpret_cast<half2*>(&lo);
   frag_b[1] = *reinterpret_cast<half2*>(&hi);
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -139,12 +160,14 @@ __device__ inline void dequant<half2, vllm::kU4B8.id(), false>(int q,
   frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
                       *reinterpret_cast<const half2*>(&MUL),
                       *reinterpret_cast<const half2*>(&ADD));
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
 __device__ inline void dequant<half2, vllm::kU4.id(), true>(int q,
                                                             half2* frag_b) {
   dequant<half2, vllm::kU4B8.id(), true>(q, frag_b);
+  // Note: SM70 replication already done in the called function
 }
 
 template <>
@@ -168,6 +191,7 @@ __device__ inline void dequant<half2, vllm::kU4.id(), false>(int q,
   frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
                       *reinterpret_cast<const half2*>(&MUL),
                       *reinterpret_cast<const half2*>(&ADD));
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -235,6 +259,7 @@ __device__ inline void dequant<half2, vllm::kU8B128.id(), true>(int q,
 
   frag_b[0] = *reinterpret_cast<half2*>(&lo);
   frag_b[1] = *reinterpret_cast<half2*>(&hi);
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -247,12 +272,16 @@ __device__ inline void dequant<half2, vllm::kU8B128.id(), false>(
                       *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
   frag_b[1] = __hsub2(frag_b[1],
                       *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
+  // Note: Replication already done by the true variant, but we need to
+  // re-replicate after the __hsub2 operations modified elements 0-1
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
 __device__ inline void dequant<half2, vllm::kU8.id(), true>(int q,
                                                             half2* frag_b) {
   dequant<half2, vllm::kU8B128.id(), true>(q, frag_b);
+  // Note: SM70 replication already done in the called function
 }
 
 template <>
@@ -265,6 +294,8 @@ __device__ inline void dequant<half2, vllm::kU8.id(), false>(int q,
                       *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
   frag_b[1] = __hsub2(frag_b[1],
                       *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
+  // Re-replicate after __hsub2 modified elements 0-1
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -333,6 +364,7 @@ __device__ inline void dequant<half2, vllm::kFE4M3fn.id(), true>(
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const half2*>(&Out1);
   frag_b[0] = *reinterpret_cast<const half2*>(&Out2);
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -351,6 +383,8 @@ __device__ inline void dequant<half2, vllm::kFE4M3fn.id(), false>(
   // Convert to half2 and apply bias
   frag_b[1] = __hmul2(frag_b[1], bias_reg);
   frag_b[0] = __hmul2(frag_b[0], bias_reg);
+  // Re-replicate after __hmul2 modified elements 0-1
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -410,6 +444,7 @@ __device__ inline void dequant<half2, vllm::kFE2M1f.id(), true>(int q,
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const half2*>(&Out1);
   frag_b[0] = *reinterpret_cast<const half2*>(&Out2);
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -428,6 +463,8 @@ __device__ inline void dequant<half2, vllm::kFE2M1f.id(), false>(
   // Convert to half2 and apply bias
   frag_b[1] = __hmul2(frag_b[1], bias_reg);
   frag_b[0] = __hmul2(frag_b[0], bias_reg);
+  // Re-replicate after __hmul2 modified elements 0-1
+  replicate_frag_b_for_sm70(frag_b);
 }
 
 template <>
@@ -528,6 +565,7 @@ __device__ inline void dequant_fp8_scales<half2, vllm::kFE4M3fn.id()>(
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const half2*>(&Out1);
   frag_b[0] = *reinterpret_cast<const half2*>(&Out2);
+  replicate_frag_b_for_sm70(frag_b);
 };
 
 template <>
