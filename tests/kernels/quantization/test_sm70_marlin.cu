@@ -93,7 +93,6 @@ __global__ void test_mma_m16n8k16_kernel(const uint32_t* A, const uint32_t* B, f
     mma_m16n8k16_sm70(A + tid * 4, B + tid * 8, frag_c);
     
     // Store outputs using correct FragC layout for SM70 (16x8 block)
-    int tid = threadIdx.x;
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
@@ -108,7 +107,6 @@ __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t
     float frag_c[4] = {0.0f};
     mma_m16n8k16_sm70_trans(A + tid * 4, B + tid * 2, B2 + tid * 2, frag_c);
     
-    int tid = threadIdx.x;
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
@@ -775,7 +773,8 @@ bool test_marlin_simulation_looped() {
         return false;
     }
     
-    printf("PASSED (Stress test: Accumulation valid over %d iters)\n", K_iters);
+    if(diff_sum <= 10.0) printf("PASSED (Stress test: Accumulation valid over %d iters)\n", K_large);
+    else printf("FAILED (Stress test: Statistical discrepancy detected)\n");
     return true;
 }
 
