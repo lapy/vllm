@@ -93,15 +93,11 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
   if constexpr (count == 4) {
-    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-                 : "r"(smem));
+    ldmatrix_m8n8_x4_sm70(a, smem_ptr);
   } else if constexpr (count == 2) {
-    asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];\n"
-                 : "=r"(a[0]), "=r"(a[1])
-                 : "r"(smem));
+    ldmatrix_m8n8_x2_sm70(a, smem_ptr);
   } else if constexpr (count == 1) {
-    asm volatile("ld.shared.b32 {%0}, [%1];\n" : "=r"(a[0]) : "r"(smem));
+    ldmatrix_m8n8_x1_sm70(a, smem_ptr);
   } else {
     static_assert(count == 1 || count == 2 || count == 4, "invalid count");
   }

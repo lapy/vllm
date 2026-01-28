@@ -127,7 +127,13 @@ thread_config_t small_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {128, 128, 256},
     {64, 128, 128},
-    {128, 64, 128}};
+    {128, 64, 128},
+    // SM70 configs
+    {16, 128, 128},
+    {16, 256, 128},
+    {32, 128, 128},
+    {32, 256, 128},
+    {32, 512, 256}};
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
@@ -135,7 +141,13 @@ thread_config_t large_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {64, 256, 256},
     {64, 128, 128},
-    {128, 64, 128}};
+    {128, 64, 128},
+    // SM70 configs
+    {16, 128, 128},
+    {16, 256, 128},
+    {32, 128, 128},
+    {32, 256, 128},
+    {32, 512, 256}};
 
 typedef struct {
   int blocks_per_sm;
