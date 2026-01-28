@@ -331,10 +331,15 @@ __global__ void marlin_simulation_dequant_kernel(
         frag_b_h2[3] = __hmul2(frag_b_h2[3], __halves2half2(S23.y, S67.y)); // n7*s7, n3*s3
         
         // Re-linearize to sh_b: sh_b[r*4 + 0] = [n1, n0], [1] = [n3, n2], [2] = [n5, n4], [3] = [n7, n6]
-        sh_b[tid * 4 + 0] = __halves2half2(frag_b_h2[0].x, frag_b_h2[1].x);
-        sh_b[tid * 4 + 1] = __halves2half2(frag_b_h2[2].x, frag_b_h2[3].x);
-        sh_b[tid * 4 + 2] = __halves2half2(frag_b_h2[0].y, frag_b_h2[1].y);
-        sh_b[tid * 4 + 3] = __halves2half2(frag_b_h2[2].y, frag_b_h2[3].y);
+        half2 res0 = __halves2half2(frag_b_h2[0].x, frag_b_h2[1].x);
+        half2 res1 = __halves2half2(frag_b_h2[2].x, frag_b_h2[3].x);
+        half2 res2 = __halves2half2(frag_b_h2[0].y, frag_b_h2[1].y);
+        half2 res3 = __halves2half2(frag_b_h2[2].y, frag_b_h2[3].y);
+        
+        sh_b[tid * 4 + 0] = *reinterpret_cast<uint32_t*>(&res0);
+        sh_b[tid * 4 + 1] = *reinterpret_cast<uint32_t*>(&res1);
+        sh_b[tid * 4 + 2] = *reinterpret_cast<uint32_t*>(&res2);
+        sh_b[tid * 4 + 3] = *reinterpret_cast<uint32_t*>(&res3);
     }
     
     __syncwarp();
