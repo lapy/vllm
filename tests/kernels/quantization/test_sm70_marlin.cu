@@ -1400,6 +1400,120 @@ bool test_debug_b_layout() {
     return true;
 }
 
+// =============================================================================
+// Multi-Warp Collision Test
+// =============================================================================
+
+__global__ void multi_warp_test_kernel(
+    const uint32_t* A_pool, // [4, 128] uint32
+    const uint32_t* B_pool, // [4, 64] uint32
+    float* C_pool           // [4, 128] float
+) {
+    int wid = threadIdx.x / 32;
+    int tid = threadIdx.x % 32;
+
+    if (wid >= 4) return;
+
+    // Directly initialize fragments with test patterns to avoid layout headaches.
+    // A = 1.0 (0x3c00)
+    // B = (wid + 1)
+    
+    uint32_t A[8];
+    uint32_t B[8];
+    
+    half h_one = __float2half(1.0f);
+    half2 h2_one = __halves2half2(h_one, h_one);
+    uint32_t u_one = *reinterpret_cast<uint32_t*>(&h2_one);
+    
+    half h_val = __float2half((float)(wid + 1));
+    half2 h2_val = __halves2half2(h_val, h_val);
+    uint32_t u_val = *reinterpret_cast<uint32_t*>(&h2_val);
+    
+    for (int i = 0; i < 8; i++) A[i] = u_one;
+    for (int i = 0; i < 8; i++) B[i] = u_val;
+
+    float frag_c[4] = {0.0f};
+    
+    // Critical section: Multiple warps call MMA which uses internal shared memory
+    mma_m16n8k16_sm70(A, B, frag_c);
+
+    // Store results
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    float* C_out = C_pool + wid * 128;
+    C_out[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C_out[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C_out[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C_out[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
+
+    // Debug print
+    if (tid == 0) {
+        printf("WID %d: A[0]=%u B[0]=%u -> FragC[0]=%f (Exp: %f)\n", 
+               wid, A[0], B[0], frag_c[0], 1.0f * (wid+1) * 16.0f);
+    }
+}
+
+bool test_multi_warp_collision() {
+    printf("Running test_multi_warp_collision (Warp Isolation Check)...\n");
+    const int N_WARPS = 4;
+    const int M=16, N=8, K=16;
+
+    std::vector<uint32_t> A_packed(N_WARPS * M * K / 2);
+    std::vector<uint32_t> B_packed(N_WARPS * K * N / 2);
+    std::vector<float> C_expected(N_WARPS * M * N);
+
+    for (int w = 0; w < N_WARPS; w++) {
+        // Give each warp a unique constant value to multiply
+        // Warp w: A=1.0, B=float(w+1). Result should be float(w+1) * K = 16 * (w+1)
+        float val_a = 1.0f;
+        float val_b = (float)(w + 1);
+        
+        for (int i = 0; i < M * K / 2; i++) {
+            half2 h2 = __halves2half2(__float2half(val_a), __float2half(val_a));
+            A_packed[w * 128 + i] = *reinterpret_cast<uint32_t*>(&h2);
+        }
+        for (int i = 0; i < K * N / 2; i++) {
+            half2 h2 = __halves2half2(__float2half(val_b), __float2half(val_b));
+            B_packed[w * 64 + i] = *reinterpret_cast<uint32_t*>(&h2);
+        }
+        for (int i = 0; i < M * N; i++) C_expected[w * 128 + i] = val_a * val_b * K;
+    }
+
+    uint32_t *dA, *dB; float *dC;
+    cudaMalloc(&dA, A_packed.size() * 4);
+    cudaMalloc(&dB, B_packed.size() * 4);
+    cudaMalloc(&dC, N_WARPS * M * N * 4);
+
+    cudaMemcpy(dA, A_packed.data(), A_packed.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_packed.data(), B_packed.size() * 4, cudaMemcpyHostToDevice);
+
+    // Launch with 128 threads in ONE block to force warp resource sharing
+    multi_warp_test_kernel<<<1, 128>>>(dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> C_out(N_WARPS * M * N);
+    cudaMemcpy(C_out.data(), dC, C_out.size() * 4, cudaMemcpyDeviceToHost);
+
+    float max_err = 0;
+    for (int i = 0; i < C_out.size(); i++) {
+        float err = abs(C_out[i] - C_expected[i]);
+        if (err > max_err) max_err = err;
+    }
+
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+
+    if (max_err > 0.1f) {
+        printf("FAILED: Max error %f. Warp collision likely!\n", max_err);
+        for(int w=0; w<4; w++) {
+            printf("Warp %d: Exp %f, Got %f\n", w, C_expected[w*128], C_out[w*128]);
+        }
+        return false;
+    }
+
+    printf("PASSED (All %d warps produced isolated results)\n", N_WARPS);
+    return true;
+}
+
 int main() {
     bool all_pass = true;
     
@@ -1424,6 +1538,9 @@ int main() {
     // Dequant and Swizzle checks
     all_pass &= test_marlin_simulation_dequant();
     
+    // Multi-warp integrity (Collision verification)
+    all_pass &= test_multi_warp_collision();
+
     // Performance Benchmark
     all_pass &= test_marlin_performance();
 

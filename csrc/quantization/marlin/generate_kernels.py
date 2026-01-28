@@ -199,6 +199,7 @@ def generate_new_kernels():
                 result_dict[(a_type, b_type, c_type)] = []
                 if a_type in ["kFloat16", "kS8"] and c_type == "kFloat16":
                     sm_75_result_dict[(a_type, b_type, c_type)] = []
+                if a_type == "kFloat16" and c_type == "kFloat16":
                     sm_70_result_dict[(a_type, b_type, c_type)] = []
 
             for group_blocks, m_blocks, thread_configs in itertools.product(

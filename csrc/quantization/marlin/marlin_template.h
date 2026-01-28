@@ -591,11 +591,7 @@ __global__ void __launch_bounds__(threads) Marlin(
   int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
   constexpr int b_sh_stride =
       ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
-  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  constexpr int b_thread_vecs = 2;
-  #else
   constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
-  #endif
   constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
@@ -1302,18 +1298,12 @@ __global__ void __launch_bounds__(threads) Marlin(
       // Each int4 in frag_b_quant has 4 ints. Each int dequantizes to 2 half2 (4 halves).
       // Total 4 * 2 = 8 half2 = 16 halves = 16 K-steps.
       // Matches FragB size 8 and mma_m16n8k16_sm70 requirements.
-      int* b_q_ptr_0 = reinterpret_cast<int*>(&frag_b_quant[k2][0]);
-      int* b_q_ptr_1 = reinterpret_cast<int*>(&frag_b_quant[k2][1]);
+      int* b_q_ptr = reinterpret_cast<int*>(&frag_b_quant[k2][0]);
       
-      dequant_data(b_q_ptr_0[0], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 0);
-      dequant_data(b_q_ptr_0[1], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 2);
-      dequant_data(b_q_ptr_0[2], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 4);
-      dequant_data(b_q_ptr_0[3], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 6);
-      
-      dequant_data(b_q_ptr_1[0], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 0);
-      dequant_data(b_q_ptr_1[1], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 2);
-      dequant_data(b_q_ptr_1[2], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 4);
-      dequant_data(b_q_ptr_1[3], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 6);
+      dequant_data(b_q_ptr[0], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 0);
+      dequant_data(b_q_ptr[1], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 2);
+      dequant_data(b_q_ptr[2], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 0);
+      dequant_data(b_q_ptr[3], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 2);
 #endif
 
 

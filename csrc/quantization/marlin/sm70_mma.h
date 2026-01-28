@@ -246,121 +246,72 @@ __device__ __forceinline__ void mma_m8n8k4_sm70_fp16(
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     int tid = threadIdx.x % 32;
+    int wid = (threadIdx.x / 32) % 8; // Support up to 8 warps (256 threads)
 
-    // Use shared memory to convert between register layout and WMMA layout
-    __shared__ half sh_a[16 * 16];  // A matrix: 16x16 row-major
-    __shared__ half sh_b[16 * 16];  // B matrix: 16x16 col-major (padded, only 16x8 used)
-    __shared__ float sh_c[16 * 16]; // C matrix: 16x16 row-major
-
-    // Step 1: Write A fragments from registers to shared memory
-    // Each thread has 8 uint32 = 16 halves for A
-    // The test kernel layout: threads distribute rows and K slices
-    // Thread t: A[0,1] = row (t%8 or t%8+8), K=0-3
-    //           A[2,3] = row (t%8 or t%8+8), K=4-7 (for threads 0-7) or K=0-3 for bottom
-    // Actually the test loads based on ldmatrix which shuffles.
-    // For WMMA, we need A in row-major: A[row][col]
-
-    // Unpack A fragments and write to shared memory in row-major order
-    // The test kernel loads A with ldmatrix emulation.
-    // For simplicity, let's reconstruct from the fragment values.
-    // Thread t contributes to specific rows based on the ldmatrix layout.
-
-    // ldmatrix x4 for m16n8k16 A layout:
-    // Threads 0-7: provide rows 0-7 data
-    // Threads 8-15: provide rows 0-7 data (different K columns)
-    // Threads 16-23: provide rows 8-15 data
-    // Threads 24-31: provide rows 8-15 data (different K columns)
+    // Use a single flat shared memory pool to ensure strict isolation between warps.
+    // Each warp needs (256 * 2) + (256 * 2) + (256 * 4) = 2KB. 8 warps = 16KB.
+    __shared__ char smem_pool[8 * 2048];
+    
+    half* sh_a = reinterpret_cast<half*>(&smem_pool[wid * 2048]);
+    half* sh_b = reinterpret_cast<half*>(&smem_pool[wid * 2048 + 512]);
+    float* sh_c = reinterpret_cast<float*>(&smem_pool[wid * 2048 + 1024]);
 
     const half* a_halves = reinterpret_cast<const half*>(A);
 
-
-    // Each thread has 16 halves for A covering K=k_base to k_base+7 (in two sets of 4)
-    // A[0,1] = 4 halves for K=k_base to k_base+3
-    // A[2,3] = 4 halves for rows 8-15 at same K (bottom tile)
-    // A[4,5] = 4 halves for K=k_base+4 to k_base+7
-    // etc.
-
     // Write top tile (rows 0-7) K values
-    if (tid < 16) {  // Threads 0-15 have top tile data
+    if (tid < 16) {
         int row = tid % 8;
-        int k_off = (tid / 8) * 8;  // 0 or 8
-
-        // A[0,1] contains 4 halves for this row, K=k_off to k_off+3
+        int k_off = (tid / 8) * 8;
         sh_a[row * 16 + k_off + 0] = a_halves[0];
         sh_a[row * 16 + k_off + 1] = a_halves[1];
         sh_a[row * 16 + k_off + 2] = a_halves[2];
         sh_a[row * 16 + k_off + 3] = a_halves[3];
-
-        // A[4,5] contains 4 halves for this row, K=k_off+4 to k_off+7
         sh_a[row * 16 + k_off + 4] = a_halves[8];
         sh_a[row * 16 + k_off + 5] = a_halves[9];
         sh_a[row * 16 + k_off + 6] = a_halves[10];
         sh_a[row * 16 + k_off + 7] = a_halves[11];
     }
-
     // Write bottom tile (rows 8-15) K values
-    if (tid >= 16) {  // Threads 16-31 have bottom tile data
+    if (tid >= 16) {
         int row = 8 + (tid % 8);
-        int k_off = ((tid - 16) / 8) * 8;  // 0 or 8
-
-        // A[2,3] contains 4 halves for this row (actually stored in A[0,1] for these threads)
+        int k_off = ((tid - 16) / 8) * 8;
         sh_a[row * 16 + k_off + 0] = a_halves[0];
         sh_a[row * 16 + k_off + 1] = a_halves[1];
         sh_a[row * 16 + k_off + 2] = a_halves[2];
         sh_a[row * 16 + k_off + 3] = a_halves[3];
-
         sh_a[row * 16 + k_off + 4] = a_halves[8];
         sh_a[row * 16 + k_off + 5] = a_halves[9];
         sh_a[row * 16 + k_off + 6] = a_halves[10];
         sh_a[row * 16 + k_off + 7] = a_halves[11];
     }
 
-    // Step 2: Write B fragments to shared memory in column-major order
-    // B is 16x8, but WMMA needs 16x16, so we'll pad with zeros
-    // The test kernel loads B with groupID = tid/4 determining the column
     const half* b_halves = reinterpret_cast<const half*>(B);
-    int b_col = tid / 4;  // 0-7
-
-    // Each thread has 16 halves for B covering all 16 K rows for one column
-    // B fragments: B[k][col] where k=0..15
+    int b_col = tid / 4;
     for (int k = 0; k < 16; k++) {
         sh_b[k * 16 + b_col] = b_halves[k];
     }
-
-    // Zero out the padding columns (8-15)
     if (tid < 8) {
         for (int k = 0; k < 16; k++) {
             sh_b[k * 16 + 8 + tid] = __float2half(0.0f);
         }
     }
 
-    __syncwarp();
+    __syncthreads();
 
-    // Step 3: Use WMMA to compute C = A * B
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_b;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_acc;
 
-    // Initialize accumulator to zero
     wmma::fill_fragment(frag_acc, 0.0f);
-
-    // Load A and B from shared memory
-    wmma::load_matrix_sync(frag_a, sh_a, 16);  // 16 = leading dimension
-    wmma::load_matrix_sync(frag_b, sh_b, 16);  // 16 = leading dimension
-
-    // Perform the matrix multiplication
+    wmma::load_matrix_sync(frag_a, sh_a, 16);
+    wmma::load_matrix_sync(frag_b, sh_b, 16);
     wmma::mma_sync(frag_acc, frag_a, frag_b, frag_acc);
-
-    // Store result to shared memory
     wmma::store_matrix_sync(sh_c, frag_acc, 16, wmma::mem_row_major);
 
-    __syncwarp();
+    __syncthreads();
 
-    // Step 4: Extract results in Marlin layout
-    // Marlin: thread t handles row (t/4), cols ((t%4)*2, (t%4)*2+1)
     int marlin_row = tid / 4;
     int marlin_col = (tid % 4) * 2;
-
     frag_c[0] = sh_c[marlin_row * 16 + marlin_col];
     frag_c[1] = sh_c[marlin_row * 16 + marlin_col + 1];
     frag_c[2] = sh_c[(marlin_row + 8) * 16 + marlin_col];
@@ -457,14 +408,16 @@ __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
 __device__ void mma_m16n8k16_sm70_direct(const half* sh_a, const half* sh_b,
                                           float* frag_c, int lda = 16, int ldb = 8) {
     int tid = threadIdx.x % 32;
+    int wid = (threadIdx.x / 32) % 8;
 
-    // Use additional shared memory for padded B and output C
-    __shared__ half sh_b_padded[16 * 16];  // B padded to 16x16
-    __shared__ float sh_c[16 * 16];        // C output 16x16
+    // Use isolated shared memory pool. Each warp needs 512 + 1024 = 1.5KB.
+    __shared__ char smem_pool_direct[8 * 1536];
 
-    // Pad B from 16x8 to 16x16 (copy existing columns, zero the rest)
-    // Each thread handles part of the padding
-    int elements_per_thread = (16 * 16) / 32;  // 8 elements per thread
+    half* sh_b_padded = reinterpret_cast<half*>(&smem_pool_direct[wid * 1536]);
+    float* sh_c = reinterpret_cast<float*>(&smem_pool_direct[wid * 1536 + 512]);
+
+    // Pad B from 16x8 to 16x16
+    int elements_per_thread = (16 * 16) / 32;
     for (int i = 0; i < elements_per_thread; i++) {
         int idx = tid * elements_per_thread + i;
         int row = idx / 16;
@@ -478,30 +431,20 @@ __device__ void mma_m16n8k16_sm70_direct(const half* sh_a, const half* sh_b,
 
     __syncwarp();
 
-    // WMMA fragments
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_acc;
 
-    // Initialize accumulator
     wmma::fill_fragment(frag_acc, 0.0f);
-
-    // Load matrices
     wmma::load_matrix_sync(frag_a, sh_a, lda);
     wmma::load_matrix_sync(frag_b, sh_b_padded, 16);
-
-    // Compute
     wmma::mma_sync(frag_acc, frag_a, frag_b, frag_acc);
-
-    // Store result
     wmma::store_matrix_sync(sh_c, frag_acc, 16, wmma::mem_row_major);
 
     __syncwarp();
 
-    // Extract in Marlin layout
     int marlin_row = tid / 4;
     int marlin_col = (tid % 4) * 2;
-
     frag_c[0] = sh_c[marlin_row * 16 + marlin_col];
     frag_c[1] = sh_c[marlin_row * 16 + marlin_col + 1];
     frag_c[2] = sh_c[(marlin_row + 8) * 16 + marlin_col];
@@ -512,9 +455,12 @@ __device__ void mma_m16n8k16_sm70_direct(const half* sh_a, const half* sh_b,
 __device__ void mma_m16n8k16_sm70_direct_accum(const half* sh_a, const half* sh_b,
                                                float* frag_c, int lda = 16, int ldb = 8) {
     int tid = threadIdx.x % 32;
+    int wid = (threadIdx.x / 32) % 8;
 
-    __shared__ half sh_b_padded[16 * 16];
-    __shared__ float sh_c[16 * 16];
+    __shared__ char smem_pool_acc[8 * 1536];
+
+    half* sh_b_padded = reinterpret_cast<half*>(&smem_pool_acc[wid * 1536]);
+    float* sh_c = reinterpret_cast<float*>(&smem_pool_acc[wid * 1536 + 512]);
 
     // Pad B
     int elements_per_thread = (16 * 16) / 32;
@@ -545,8 +491,6 @@ __device__ void mma_m16n8k16_sm70_direct_accum(const half* sh_a, const half* sh_
 
     int marlin_row = tid / 4;
     int marlin_col = (tid % 4) * 2;
-
-    // Accumulate to existing values
     frag_c[0] += sh_c[marlin_row * 16 + marlin_col];
     frag_c[1] += sh_c[marlin_row * 16 + marlin_col + 1];
     frag_c[2] += sh_c[(marlin_row + 8) * 16 + marlin_col];
