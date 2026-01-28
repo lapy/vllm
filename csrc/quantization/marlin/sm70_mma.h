@@ -7,8 +7,11 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <mma.h>
 
 namespace MARLIN_NAMESPACE_NAME {
+
+using namespace nvcuda;
 
 // Compile-time architecture verification
 #if defined(__CUDA_ARCH__)
@@ -33,24 +36,9 @@ __device__ __forceinline__ int get_sm70_quadpair() {
 // =============================================================================
 // ldmatrix emulation for SM70 (Volta)
 // 
-// The ldmatrix.sync.aligned.m8n8.x{1,2,4}.shared.b16 instruction is not 
-// available on SM70. We emulate it using warp shuffles.
-//
-// ldmatrix loads matrix fragments from shared memory into registers in the
-// exact layout required by tensor core MMA operations. The instruction performs
-// a warp-collective gather where each thread contributes an address and 
-// receives values according to the MMA fragment layout.
-//
-// For m8n8.x4 with b16 elements (half precision):
-// - Threads 0-7 each provide address for one row of an 8x8 matrix
-// - Each thread receives 4 uint32_t values (8 half values)
-// - Output layout matches mma.m16n8k16 fragment requirements
+// Emulates ldmatrix.m8n8.x{1,2,4} via warp shuffles.
+// For x4: Thread t receives rows (t%8) and (t%8)+8, distributed across 4 registers.
 // =============================================================================
-
-// ldmatrix fragment layout for m16n8k16 (A matrix):
-// Per-thread distribution for FragA[4] (4 x uint32_t = 8 x half):
-//   Lane i contributes bytes for specific (row, col) positions
-//   The actual mapping matches PTX mma.m16n8k16 operand A layout
 
 // Emulates ldmatrix.sync.aligned.m8n8.x1.shared.b16
 // Each thread provides address to beginning of an 8-element row (16 bytes)
@@ -175,17 +163,38 @@ __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70(
     int src_row_top = row_in_group;  // lanes 0-7 have rows 0-7
     int src_row_bot = row_in_group + 16;  // lanes 16-23 have rows 8-15
     
+    // To avoid divergence (where threads process different 'word_base' indices
+    // and thus execute different shuffle instructions), we shuffle ALL words.
+    // This ensures Thread 0 (producing word 0) and Thread 8 (consuming word 2 from Thread 0)
+    // coordinate correctly.
+    
+    uint32_t b0 = __shfl_sync(FULL_MASK, my_words[0], src_row_top);
+    uint32_t b1 = __shfl_sync(FULL_MASK, my_words[1], src_row_top);
+    uint32_t b2 = __shfl_sync(FULL_MASK, my_words[2], src_row_top);
+    uint32_t b3 = __shfl_sync(FULL_MASK, my_words[3], src_row_top);
+
     // Word selection based on column grouping
-    // col_pair=0: words 0,1  col_pair=1: words 2,3
-    int word_base = col_pair * 2;
+    if (col_pair == 0) {
+        dst[0] = b0;
+        dst[1] = b1;
+    } else {
+        dst[0] = b2;
+        dst[1] = b3;
+    }
     
-    // Get values from top half rows (lanes 0-7)
-    dst[0] = __shfl_sync(FULL_MASK, my_words[word_base + 0], src_row_top);
-    dst[1] = __shfl_sync(FULL_MASK, my_words[word_base + 1], src_row_top);
+    // Repeat for bottom half
+    b0 = __shfl_sync(FULL_MASK, my_words[0], src_row_bot);
+    b1 = __shfl_sync(FULL_MASK, my_words[1], src_row_bot);
+    b2 = __shfl_sync(FULL_MASK, my_words[2], src_row_bot);
+    b3 = __shfl_sync(FULL_MASK, my_words[3], src_row_bot);
     
-    // Get values from bottom half rows (lanes 16-23)  
-    dst[2] = __shfl_sync(FULL_MASK, my_words[word_base + 0], src_row_bot);
-    dst[3] = __shfl_sync(FULL_MASK, my_words[word_base + 1], src_row_bot);
+    if (col_pair == 0) {
+        dst[2] = b0;
+        dst[3] = b1;
+    } else {
+        dst[2] = b2;
+        dst[3] = b3;
+    }
 }
 
 
@@ -227,111 +236,135 @@ __device__ __forceinline__ void mma_m8n8k4_sm70_fp16(
         : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
 }
 
+
+
 // =============================================================================
-// Internal helpers for mma_m16n8k16 variants
+// WMMA-based mma_m16n8k16 for Volta (SM70)
+// Uses nvcuda::wmma (m16n16k16) with shared memory reconstruction.
+// Results extracted into Marlin layout: 4 floats per thread.
 // =============================================================================
-
-__device__ __forceinline__ void mma_m16n8k16_step_float(
-    float* frag_c, bool bottom, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) 
-{
-    const uint32_t FULL_MASK = 0xFFFFFFFF;
-    int tid = threadIdx.x % 32;
-    float c_row[8];
-    int my_row_idx = tid % 8;
-    int my_col_group = tid / 8; // 0, 1, 2, 3
-    int frag_offset = bottom ? 2 : 0;
-    
-    // 1. Gather Initial Accumulators
-    c_row[my_col_group] = frag_c[frag_offset + 0];
-    c_row[my_col_group + 4] = frag_c[frag_offset + 1];
-    
-    // 2. Distribute Row to Redundant Threads
-    for(int i=0; i<4; i++) {
-        c_row[i]   = __shfl_sync(FULL_MASK, c_row[i],   my_row_idx + i*8);
-        c_row[i+4] = __shfl_sync(FULL_MASK, c_row[i+4], my_row_idx + i*8);
-    }
-    
-    // 3. Hardware MMA
-    mma_m8n8k4_sm70(a0, a1, b0, b1, c_row);
-    
-    // 4. Extract Result
-    frag_c[frag_offset + 0] = c_row[my_col_group];
-    frag_c[frag_offset + 1] = c_row[my_col_group + 4];
-}
-
-__device__ __forceinline__ void mma_m16n8k16_step_fp16(
-    uint32_t* frag_c, bool bottom, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) 
-{
-    const uint32_t FULL_MASK = 0xFFFFFFFF;
-    int tid = threadIdx.x % 32;
-    uint32_t c_row[4]; // 8 halves
-    int tid_in_grp = tid % 16;
-    int grp = tid / 16; // 0, 1
-    int frag_offset = bottom ? 2 : 0;
-    
-    c_row[grp * 2 + 0] = frag_c[frag_offset + 0];
-    c_row[grp * 2 + 1] = frag_c[frag_offset + 1];
-    
-    for(int i=0; i<2; i++) {
-        c_row[i*2 + 0] = __shfl_sync(FULL_MASK, c_row[i*2 + 0], tid_in_grp + i*16);
-        c_row[i*2 + 1] = __shfl_sync(FULL_MASK, c_row[i*2 + 1], tid_in_grp + i*16);
-    }
-    
-    mma_m8n8k4_sm70_fp16(a0, a1, b0, b1, c_row);
-    
-    frag_c[frag_offset + 0] = c_row[grp * 2 + 0];
-    frag_c[frag_offset + 1] = c_row[grp * 2 + 1];
-}
-
-// Hardware-accurate mma_m16n8k16 using 4-threads-per-row partitioning.
-// Each result row is managed by 4 threads; each thread owns 2 columns.
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
-    const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
-    int col_pair = (tid % 4);
 
-    #pragma unroll
-    for (int k = 0; k < 4; k++) {
-        // --- Step 1: Prepare A ---
-        int k_part = (k / 2);
-        uint32_t a0_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 0], (tid % 8) + k_part * 8);
-        uint32_t a1_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 1], (tid % 8) + k_part * 8);
-        uint32_t a0_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 4], (tid % 8) + 16 + k_part * 8);
-        uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + k_part * 8);
+    // Use shared memory to convert between register layout and WMMA layout
+    __shared__ half sh_a[16 * 16];  // A matrix: 16x16 row-major
+    __shared__ half sh_b[16 * 16];  // B matrix: 16x16 col-major (padded, only 16x8 used)
+    __shared__ float sh_c[16 * 16]; // C matrix: 16x16 row-major
 
-        // --- Step 2: Prepare B ---
-        // Thread T loaded column (T % 8) into its B registers.
-        // Thread T needs columns col_pair*2 and col_pair*2+1.
-        // Shuffle from the threads that have those columns.
-        // Columns 0,1 are in threads 0,1 (and 8,9, 16,17, 24,25).
-        // Use base lane = (tid / 8) * 8 to stay in thread's own group.
-        int base_lane = (tid / 8) * 8;
-        uint32_t b0_c0 = __shfl_sync(FULL_MASK, B[k * 2], base_lane + col_pair * 2);
-        uint32_t b1_c0 = __shfl_sync(FULL_MASK, B[k * 2 + 1], base_lane + col_pair * 2);
-        uint32_t b0_c1 = __shfl_sync(FULL_MASK, B[k * 2], base_lane + col_pair * 2 + 1);
-        uint32_t b1_c1 = __shfl_sync(FULL_MASK, B[k * 2 + 1], base_lane + col_pair * 2 + 1);
+    // Step 1: Write A fragments from registers to shared memory
+    // Each thread has 8 uint32 = 16 halves for A
+    // The test kernel layout: threads distribute rows and K slices
+    // Thread t: A[0,1] = row (t%8 or t%8+8), K=0-3
+    //           A[2,3] = row (t%8 or t%8+8), K=4-7 (for threads 0-7) or K=0-3 for bottom
+    // Actually the test loads based on ldmatrix which shuffles.
+    // For WMMA, we need A in row-major: A[row][col]
 
-        // --- Step 3: Compute columns 0 and 1 separately ---
-        // Compute for column col_pair*2
-        float c_step_t0[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_t, a1_t, b0_c0, b1_c0, c_step_t0);
-        frag_c[0] += c_step_t0[col_pair * 2 + 0];
+    // Unpack A fragments and write to shared memory in row-major order
+    // The test kernel loads A with ldmatrix emulation.
+    // For simplicity, let's reconstruct from the fragment values.
+    // Thread t contributes to specific rows based on the ldmatrix layout.
 
-        // Compute for column col_pair*2+1
-        float c_step_t1[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_t, a1_t, b0_c1, b1_c1, c_step_t1);
-        frag_c[1] += c_step_t1[col_pair * 2 + 1];
+    // ldmatrix x4 for m16n8k16 A layout:
+    // Threads 0-7: provide rows 0-7 data
+    // Threads 8-15: provide rows 0-7 data (different K columns)
+    // Threads 16-23: provide rows 8-15 data
+    // Threads 24-31: provide rows 8-15 data (different K columns)
 
-        // Bottom rows
-        float c_step_b0[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_b, a1_b, b0_c0, b1_c0, c_step_b0);
-        frag_c[2] += c_step_b0[col_pair * 2 + 0];
+    const half* a_halves = reinterpret_cast<const half*>(A);
 
-        float c_step_b1[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_b, a1_b, b0_c1, b1_c1, c_step_b1);
-        frag_c[3] += c_step_b1[col_pair * 2 + 1];
+
+    // Each thread has 16 halves for A covering K=k_base to k_base+7 (in two sets of 4)
+    // A[0,1] = 4 halves for K=k_base to k_base+3
+    // A[2,3] = 4 halves for rows 8-15 at same K (bottom tile)
+    // A[4,5] = 4 halves for K=k_base+4 to k_base+7
+    // etc.
+
+    // Write top tile (rows 0-7) K values
+    if (tid < 16) {  // Threads 0-15 have top tile data
+        int row = tid % 8;
+        int k_off = (tid / 8) * 8;  // 0 or 8
+
+        // A[0,1] contains 4 halves for this row, K=k_off to k_off+3
+        sh_a[row * 16 + k_off + 0] = a_halves[0];
+        sh_a[row * 16 + k_off + 1] = a_halves[1];
+        sh_a[row * 16 + k_off + 2] = a_halves[2];
+        sh_a[row * 16 + k_off + 3] = a_halves[3];
+
+        // A[4,5] contains 4 halves for this row, K=k_off+4 to k_off+7
+        sh_a[row * 16 + k_off + 4] = a_halves[8];
+        sh_a[row * 16 + k_off + 5] = a_halves[9];
+        sh_a[row * 16 + k_off + 6] = a_halves[10];
+        sh_a[row * 16 + k_off + 7] = a_halves[11];
     }
+
+    // Write bottom tile (rows 8-15) K values
+    if (tid >= 16) {  // Threads 16-31 have bottom tile data
+        int row = 8 + (tid % 8);
+        int k_off = ((tid - 16) / 8) * 8;  // 0 or 8
+
+        // A[2,3] contains 4 halves for this row (actually stored in A[0,1] for these threads)
+        sh_a[row * 16 + k_off + 0] = a_halves[0];
+        sh_a[row * 16 + k_off + 1] = a_halves[1];
+        sh_a[row * 16 + k_off + 2] = a_halves[2];
+        sh_a[row * 16 + k_off + 3] = a_halves[3];
+
+        sh_a[row * 16 + k_off + 4] = a_halves[8];
+        sh_a[row * 16 + k_off + 5] = a_halves[9];
+        sh_a[row * 16 + k_off + 6] = a_halves[10];
+        sh_a[row * 16 + k_off + 7] = a_halves[11];
+    }
+
+    // Step 2: Write B fragments to shared memory in column-major order
+    // B is 16x8, but WMMA needs 16x16, so we'll pad with zeros
+    // The test kernel loads B with groupID = tid/4 determining the column
+    const half* b_halves = reinterpret_cast<const half*>(B);
+    int b_col = tid / 4;  // 0-7
+
+    // Each thread has 16 halves for B covering all 16 K rows for one column
+    // B fragments: B[k][col] where k=0..15
+    for (int k = 0; k < 16; k++) {
+        sh_b[k * 16 + b_col] = b_halves[k];
+    }
+
+    // Zero out the padding columns (8-15)
+    if (tid < 8) {
+        for (int k = 0; k < 16; k++) {
+            sh_b[k * 16 + 8 + tid] = __float2half(0.0f);
+        }
+    }
+
+    __syncwarp();
+
+    // Step 3: Use WMMA to compute C = A * B
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_acc;
+
+    // Initialize accumulator to zero
+    wmma::fill_fragment(frag_acc, 0.0f);
+
+    // Load A and B from shared memory
+    wmma::load_matrix_sync(frag_a, sh_a, 16);  // 16 = leading dimension
+    wmma::load_matrix_sync(frag_b, sh_b, 16);  // 16 = leading dimension
+
+    // Perform the matrix multiplication
+    wmma::mma_sync(frag_acc, frag_a, frag_b, frag_acc);
+
+    // Store result to shared memory
+    wmma::store_matrix_sync(sh_c, frag_acc, 16, wmma::mem_row_major);
+
+    __syncwarp();
+
+    // Step 4: Extract results in Marlin layout
+    // Marlin: thread t handles row (t/4), cols ((t%4)*2, (t%4)*2+1)
+    int marlin_row = tid / 4;
+    int marlin_col = (tid % 4) * 2;
+
+    frag_c[0] = sh_c[marlin_row * 16 + marlin_col];
+    frag_c[1] = sh_c[marlin_row * 16 + marlin_col + 1];
+    frag_c[2] = sh_c[(marlin_row + 8) * 16 + marlin_col];
+    frag_c[3] = sh_c[(marlin_row + 8) * 16 + marlin_col + 1];
 }
 
 __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
@@ -412,6 +445,112 @@ __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     mma_m16n8k16_sm70(A, B, frag_c);
     mma_m16n8k16_sm70(A + 8, B + 8, frag_c);
+}
+
+// =============================================================================
+// Direct WMMA-based MMA (Shared Memory Interface)
+// 
+// Operates on matrices already in shared memory. 
+// Pads B (16x8 -> 16x16) and computes C = A * B.
+// Results extracted into Marlin layout.
+// =============================================================================
+__device__ void mma_m16n8k16_sm70_direct(const half* sh_a, const half* sh_b,
+                                          float* frag_c, int lda = 16, int ldb = 8) {
+    int tid = threadIdx.x % 32;
+
+    // Use additional shared memory for padded B and output C
+    __shared__ half sh_b_padded[16 * 16];  // B padded to 16x16
+    __shared__ float sh_c[16 * 16];        // C output 16x16
+
+    // Pad B from 16x8 to 16x16 (copy existing columns, zero the rest)
+    // Each thread handles part of the padding
+    int elements_per_thread = (16 * 16) / 32;  // 8 elements per thread
+    for (int i = 0; i < elements_per_thread; i++) {
+        int idx = tid * elements_per_thread + i;
+        int row = idx / 16;
+        int col = idx % 16;
+        if (col < 8) {
+            sh_b_padded[row * 16 + col] = sh_b[row * ldb + col];
+        } else {
+            sh_b_padded[row * 16 + col] = __float2half(0.0f);
+        }
+    }
+
+    __syncwarp();
+
+    // WMMA fragments
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_acc;
+
+    // Initialize accumulator
+    wmma::fill_fragment(frag_acc, 0.0f);
+
+    // Load matrices
+    wmma::load_matrix_sync(frag_a, sh_a, lda);
+    wmma::load_matrix_sync(frag_b, sh_b_padded, 16);
+
+    // Compute
+    wmma::mma_sync(frag_acc, frag_a, frag_b, frag_acc);
+
+    // Store result
+    wmma::store_matrix_sync(sh_c, frag_acc, 16, wmma::mem_row_major);
+
+    __syncwarp();
+
+    // Extract in Marlin layout
+    int marlin_row = tid / 4;
+    int marlin_col = (tid % 4) * 2;
+
+    frag_c[0] = sh_c[marlin_row * 16 + marlin_col];
+    frag_c[1] = sh_c[marlin_row * 16 + marlin_col + 1];
+    frag_c[2] = sh_c[(marlin_row + 8) * 16 + marlin_col];
+    frag_c[3] = sh_c[(marlin_row + 8) * 16 + marlin_col + 1];
+}
+
+// Accumulating version - adds to existing frag_c values
+__device__ void mma_m16n8k16_sm70_direct_accum(const half* sh_a, const half* sh_b,
+                                               float* frag_c, int lda = 16, int ldb = 8) {
+    int tid = threadIdx.x % 32;
+
+    __shared__ half sh_b_padded[16 * 16];
+    __shared__ float sh_c[16 * 16];
+
+    // Pad B
+    int elements_per_thread = (16 * 16) / 32;
+    for (int i = 0; i < elements_per_thread; i++) {
+        int idx = tid * elements_per_thread + i;
+        int row = idx / 16;
+        int col = idx % 16;
+        if (col < 8) {
+            sh_b_padded[row * 16 + col] = sh_b[row * ldb + col];
+        } else {
+            sh_b_padded[row * 16 + col] = __float2half(0.0f);
+        }
+    }
+
+    __syncwarp();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> frag_b;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_acc;
+
+    wmma::fill_fragment(frag_acc, 0.0f);
+    wmma::load_matrix_sync(frag_a, sh_a, lda);
+    wmma::load_matrix_sync(frag_b, sh_b_padded, 16);
+    wmma::mma_sync(frag_acc, frag_a, frag_b, frag_acc);
+    wmma::store_matrix_sync(sh_c, frag_acc, 16, wmma::mem_row_major);
+
+    __syncwarp();
+
+    int marlin_row = tid / 4;
+    int marlin_col = (tid % 4) * 2;
+
+    // Accumulate to existing values
+    frag_c[0] += sh_c[marlin_row * 16 + marlin_col];
+    frag_c[1] += sh_c[marlin_row * 16 + marlin_col + 1];
+    frag_c[2] += sh_c[(marlin_row + 8) * 16 + marlin_col];
+    frag_c[3] += sh_c[(marlin_row + 8) * 16 + marlin_col + 1];
 }
 
 } // namespace MARLIN_NAMESPACE_NAME

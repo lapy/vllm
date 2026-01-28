@@ -131,10 +131,9 @@ __device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
   scalar_t2 s = MarlinScalarType<type_id>::num2num2(
       reinterpret_cast<scalar_t*>(&frag_s)[i]);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  frag_b[0] = __hmul2(frag_b[0], s);
-  frag_b[1] = __hmul2(frag_b[1], s);
-  frag_b[2] = __hmul2(frag_b[2], s);
-  frag_b[3] = __hmul2(frag_b[3], s);
+  #pragma unroll
+  for (int j = 0; j < 8; j++)
+    frag_b[j] = __hmul2(frag_b[j], s);
 #else
   frag_b[0] = __hmul2(frag_b[0], s);
   frag_b[1] = __hmul2(frag_b[1], s);
@@ -151,10 +150,9 @@ __device__ inline void scale_and_sub(
   scalar_t2 s2 = MarlinScalarType<type_id>::num2num2(s);
   scalar_t2 zp2 = MarlinScalarType<type_id>::num2num2(zp);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  frag_b[0] = __hfma2(frag_b[0], s2, __hneg2(zp2));
-  frag_b[1] = __hfma2(frag_b[1], s2, __hneg2(zp2));
-  frag_b[2] = __hfma2(frag_b[2], s2, __hneg2(zp2));
-  frag_b[3] = __hfma2(frag_b[3], s2, __hneg2(zp2));
+  #pragma unroll
+  for (int j = 0; j < 8; j++)
+    frag_b[j] = __hfma2(frag_b[j], s2, __hneg2(zp2));
 #else
   frag_b[0] = __hfma2(frag_b[0], s2, __hneg2(zp2));
   frag_b[1] = __hfma2(frag_b[1], s2, __hneg2(zp2));
@@ -170,10 +168,9 @@ __device__ inline void sub_zp(
   scalar_t2 zp = MarlinScalarType<type_id>::num2num2(
       reinterpret_cast<scalar_t*>(&frag_zp)[i]);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  frag_b[0] = __hsub2(frag_b[0], zp);
-  frag_b[1] = __hsub2(frag_b[1], zp);
-  frag_b[2] = __hsub2(frag_b[2], zp);
-  frag_b[3] = __hsub2(frag_b[3], zp);
+  #pragma unroll
+  for (int j = 0; j < 8; j++)
+    frag_b[j] = __hsub2(frag_b[j], zp);
 #else
   frag_b[0] = __hsub2(frag_b[0], zp);
   frag_b[1] = __hsub2(frag_b[1], zp);
@@ -199,11 +196,15 @@ __device__ inline void scale4(
   s_val_3_4.x = reinterpret_cast<scalar_t*>(&frag_s_3)[i];
   s_val_3_4.y = reinterpret_cast<scalar_t*>(&frag_s_4)[i];
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  #pragma unroll
+  for (int j = 0; j < 8; j += 2) {
+    frag_b[j] = __hmul2(frag_b[j], s_val_1_2);
+    frag_b[j+1] = __hmul2(frag_b[j+1], s_val_3_4);
+  }
+#else
   frag_b[0] = __hmul2(frag_b[0], s_val_1_2);
   frag_b[1] = __hmul2(frag_b[1], s_val_3_4);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  frag_b[2] = __hmul2(frag_b[2], s_val_1_2); // Note: mapping might need care, but as fallback redundancy it's safe
-  frag_b[3] = __hmul2(frag_b[3], s_val_3_4);
 #endif
 }
 
@@ -330,9 +331,15 @@ __global__ void __launch_bounds__(threads) Marlin(
   #endif
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-  // Turing/Volta TensorCore only supports fp16 and int8
+  // Turing TensorCore supports fp16 and int8. 
+  // Volta TensorCore only supports fp16.
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  if constexpr (a_type_id != vllm::kFloat16.id())
+    return;
+  #else
   if constexpr (a_type_id != vllm::kFloat16.id() && a_type_id != vllm::kS8.id())
     return;
+  #endif
   #endif
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
@@ -584,7 +591,11 @@ __global__ void __launch_bounds__(threads) Marlin(
   int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
   constexpr int b_sh_stride =
       ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  constexpr int b_thread_vecs = 2;
+  #else
   constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
+  #endif
   constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
