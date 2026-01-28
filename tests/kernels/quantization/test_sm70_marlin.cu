@@ -21,6 +21,15 @@
 #include <iostream>
 #include <random>
 
+#define MARLIN_STANDALONE_TEST
+#ifndef TORCH_CHECK
+#define TORCH_CHECK(cond, ...) \
+    if (!(cond)) { \
+        printf("Check failed: " #cond "\n"); \
+        exit(1); \
+    }
+#endif
+
 // Define namespace before including
 #define MARLIN_NAMESPACE_NAME marlin_test
 #include "sm70_mma.h"

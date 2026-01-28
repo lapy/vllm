@@ -2,10 +2,12 @@
 
 #ifndef _marlin_cuh
   #define _marlin_cuh
+#ifndef MARLIN_STANDALONE_TEST
   #include <torch/all.h>
 
   #include <ATen/cuda/CUDAContext.h>
   #include <c10/cuda/CUDAGuard.h>
+#endif
   #include <cuda.h>
   #include <cuda_fp16.h>
   #include <cuda_runtime.h>

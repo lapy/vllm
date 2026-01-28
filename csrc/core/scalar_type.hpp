@@ -1,7 +1,24 @@
 #pragma once
 
 // For TORCH_CHECK
+#ifndef MARLIN_STANDALONE_TEST
 #include <torch/library.h>
+#else
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <variant>
+#include <tuple>
+#include <string>
+#include <type_traits>
+#ifndef TORCH_CHECK
+#define TORCH_CHECK(cond, ...) \
+  if (!(cond)) {               \
+    printf("Check failed: " #cond " %s\n", ##__VA_ARGS__); \
+    exit(1);                   \
+  }
+#endif
+#endif
 
 namespace vllm {
 
