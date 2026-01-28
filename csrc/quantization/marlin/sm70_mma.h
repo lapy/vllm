@@ -265,46 +265,66 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
     float c[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
     float dummy[2];
 
-    // k=0: Process first k-slice (k dimension elements 0-3)
+    const half2* A_h = reinterpret_cast<const half2*>(A);
+    const half2* B_h = reinterpret_cast<const half2*>(B);
+
+    // SM70 ldmatrix returns:
+    // A[0], A[1] -> Top 8 rows (distributed)
+    // A[2], A[3] -> Bottom 8 rows (distributed)
+    // We must correctly route these to the Top/Bot accumulators.
+
+    // k=0: Process first k-slice
     {
-        half2 a = *reinterpret_cast<const half2*>(&A[0]);
-        half2 b = *reinterpret_cast<const half2*>(&B[0]);
-        half2 a_top = __halves2half2(a.x, a.x);
-        half2 a_bot = __halves2half2(a.y, a.y);
-        half2 b_use = __halves2half2(b.x, b.x);
+        half2 a_t = A_h[0]; // Top K0, K1
+        half2 a_b = A_h[2]; // Bot K0, K1
+        half2 b_pair = B_h[0];
+
+        half2 a_top = __halves2half2(a_t.x, a_t.x); 
+        half2 a_bot = __halves2half2(a_b.x, a_b.x);
+        half2 b_use = __halves2half2(b_pair.x, b_pair.x);
+        
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
 
     // k=1
     {
-        half2 a = *reinterpret_cast<const half2*>(&A[1]);
-        half2 b = *reinterpret_cast<const half2*>(&B[1]);
-        half2 a_top = __halves2half2(a.x, a.x);
-        half2 a_bot = __halves2half2(a.y, a.y);
-        half2 b_use = __halves2half2(b.y, b.y);
+        half2 a_t = A_h[0];
+        half2 a_b = A_h[2];
+        half2 b_pair = B_h[0];
+
+        half2 a_top = __halves2half2(a_t.y, a_t.y);
+        half2 a_bot = __halves2half2(a_b.y, a_b.y);
+        half2 b_use = __halves2half2(b_pair.y, b_pair.y);
+        
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
 
     // k=2
     {
-        half2 a = *reinterpret_cast<const half2*>(&A[2]);
-        half2 b = *reinterpret_cast<const half2*>(&B[2]);
-        half2 a_top = __halves2half2(a.x, a.x);
-        half2 a_bot = __halves2half2(a.y, a.y);
-        half2 b_use = __halves2half2(b.x, b.x);
+        half2 a_t = A_h[1]; // Top K2, K3
+        half2 a_b = A_h[3]; // Bot K2, K3
+        half2 b_pair = B_h[1];
+
+        half2 a_top = __halves2half2(a_t.x, a_t.x);
+        half2 a_bot = __halves2half2(a_b.x, a_b.x);
+        half2 b_use = __halves2half2(b_pair.x, b_pair.x);
+        
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
 
     // k=3
     {
-        half2 a = *reinterpret_cast<const half2*>(&A[3]);
-        half2 b = *reinterpret_cast<const half2*>(&B[3]);
-        half2 a_top = __halves2half2(a.x, a.x);
-        half2 a_bot = __halves2half2(a.y, a.y);
-        half2 b_use = __halves2half2(b.y, b.y);
+        half2 a_t = A_h[1];
+        half2 a_b = A_h[3];
+        half2 b_pair = B_h[1];
+
+        half2 a_top = __halves2half2(a_t.y, a_t.y);
+        half2 a_bot = __halves2half2(a_b.y, a_b.y);
+        half2 b_use = __halves2half2(b_pair.y, b_pair.y);
+        
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
