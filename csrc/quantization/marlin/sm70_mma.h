@@ -294,32 +294,43 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
     #pragma unroll
     for (int k = 0; k < 4; k++) {
         // --- Step 1: Prepare A ---
-        // Row r pieces are in T(r%8 + 16*(r/8)) and T(r%8 + 16*(r/8) + 8).
-        // Piece k=0,1 (K=0-7). Piece k=2,3 (K=8-15).
         int k_part = (k / 2);
-        // A indices: A[0..3] rows 0-7, A[4..7] rows 8-15
         uint32_t a0_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 0], (tid % 8) + k_part * 8);
         uint32_t a1_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 1], (tid % 8) + k_part * 8);
         uint32_t a0_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 4], (tid % 8) + 16 + k_part * 8);
         uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + k_part * 8);
 
         // --- Step 2: Prepare B ---
-        // Each thread already holds its column's K-rows in B[0..7].
-        // B[k] contains halves for K=2k..2k+1 for this thread's column.
-        // Use thread-local B directly (no shuffle needed).
-        uint32_t b0 = B[k * 2];
-        uint32_t b1 = B[k * 2 + 1];
+        // Thread T loaded column (T % 8) into its B registers.
+        // Thread T needs columns col_pair*2 and col_pair*2+1.
+        // Shuffle from the threads that have those columns.
+        // Columns 0,1 are in threads 0,1 (and 8,9, 16,17, 24,25).
+        // Use base lane = (tid / 8) * 8 to stay in thread's own group.
+        int base_lane = (tid / 8) * 8;
+        uint32_t b0_c0 = __shfl_sync(FULL_MASK, B[k * 2], base_lane + col_pair * 2);
+        uint32_t b1_c0 = __shfl_sync(FULL_MASK, B[k * 2 + 1], base_lane + col_pair * 2);
+        uint32_t b0_c1 = __shfl_sync(FULL_MASK, B[k * 2], base_lane + col_pair * 2 + 1);
+        uint32_t b1_c1 = __shfl_sync(FULL_MASK, B[k * 2 + 1], base_lane + col_pair * 2 + 1);
 
-        // --- Step 3: Compute and Partition ---
-        float c_step_t[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_t, a1_t, b0, b1, c_step_t); 
-        frag_c[0] += c_step_t[col_pair * 2 + 0];
-        frag_c[1] += c_step_t[col_pair * 2 + 1];
+        // --- Step 3: Compute columns 0 and 1 separately ---
+        // Compute for column col_pair*2
+        float c_step_t0[8] = {0,0,0,0,0,0,0,0};
+        mma_m8n8k4_sm70(a0_t, a1_t, b0_c0, b1_c0, c_step_t0);
+        frag_c[0] += c_step_t0[col_pair * 2 + 0];
 
-        float c_step_b[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_b, a1_b, b0, b1, c_step_b);
-        frag_c[2] += c_step_b[col_pair * 2 + 0];
-        frag_c[3] += c_step_b[col_pair * 2 + 1];
+        // Compute for column col_pair*2+1
+        float c_step_t1[8] = {0,0,0,0,0,0,0,0};
+        mma_m8n8k4_sm70(a0_t, a1_t, b0_c1, b1_c1, c_step_t1);
+        frag_c[1] += c_step_t1[col_pair * 2 + 1];
+
+        // Bottom rows
+        float c_step_b0[8] = {0,0,0,0,0,0,0,0};
+        mma_m8n8k4_sm70(a0_b, a1_b, b0_c0, b1_c0, c_step_b0);
+        frag_c[2] += c_step_b0[col_pair * 2 + 0];
+
+        float c_step_b1[8] = {0,0,0,0,0,0,0,0};
+        mma_m8n8k4_sm70(a0_b, a1_b, b0_c1, b1_c1, c_step_b1);
+        frag_c[3] += c_step_b1[col_pair * 2 + 1];
     }
 }
 
