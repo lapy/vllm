@@ -298,49 +298,43 @@ __global__ void marlin_simulation_dequant_kernel(
     int tid = threadIdx.x;
     if (tid >= 32) return;
 
-    // A swizzling logic from marlin_template.h
-    auto transform_a = [&](int i) {
-        int row = i / 8; // a_sh_stride for 16x16 is 8 uint32s
-        return 8 * row + (i % 8) ^ (row % 8);
-    };
-
-    // --- STAGE 1: Load and Swizzle A ---
-    // Threads 0-31 each load 4 uint32s
+    // --- STAGE 1: Load A ---
+    // Linear load for now to ensure numerical baseline
     for (int i = 0; i < 4; i++) {
         int linear_idx = tid * 4 + i;
         if (linear_idx < 128) {
-            sh_a[transform_a(linear_idx)] = A_global[linear_idx];
+            sh_a[linear_idx] = A_global[linear_idx];
         }
     }
     
-    // --- STAGE 2: Load B, Dequantize, and Store ---
-    // B_quant is 16x8 4-bit = 128 elements = 64 bytes = 16 uint32s
-    // Each thread T0-T15 loads 1 uint32 (8 values) and dequantizes.
+    // --- STAGE 2: Load B, Dequantize, and Store Linearized ---
     if (tid < 16) {
         uint32_t q = B_quant[tid];
         half2 frag_b_h2[4]; // 8 halves total
         
-        // Dequant 1st set (cols 0-3: extracts as [e2,e0] and [e3,e1])
+        // Dequant 1st set (n4, n0) and (n5, n1)
         dequant<half2, vllm::kU4.id(), false>(q, &frag_b_h2[0]);
-        // Dequant 2nd set (cols 4-7: extracts as [e6,e4] and [e7,e5])
-        dequant<half2, vllm::kU4.id(), false>(q >> 16, &frag_b_h2[2]);
+        // Dequant 2nd set (n6, n2) and (n7, n3)
+        dequant<half2, vllm::kU4.id(), false>(q >> 8, &frag_b_h2[2]);
         
         // Correct per-column scale application
-        // scales[0] = [s1, s0], scales[1] = [s3, s2], etc.
-        half2 s01 = *reinterpret_cast<const half2*>(&scales[0]);
-        half2 s23 = *reinterpret_cast<const half2*>(&scales[1]);
-        half2 s45 = *reinterpret_cast<const half2*>(&scales[2]);
-        half2 s67 = *reinterpret_cast<const half2*>(&scales[3]);
+        // S01 = [s1, s0], S23 = [s3, s2], S45 = [s5, s4], S67 = [s7, s6]
+        half2 S01 = *reinterpret_cast<const half2*>(&scales[0]);
+        half2 S23 = *reinterpret_cast<const half2*>(&scales[1]);
+        half2 S45 = *reinterpret_cast<const half2*>(&scales[2]);
+        half2 S67 = *reinterpret_cast<const half2*>(&scales[3]);
         
-        // Layout from dequant is [e2, e0], [e3, e1], [e6, e4], [e7, e5]
-        frag_b_h2[0] = __hmul2(frag_b_h2[0], __halves2half2(s01.x, s23.x)); // e2*s2, e0*s0
-        frag_b_h2[1] = __hmul2(frag_b_h2[1], __halves2half2(s01.y, s23.y)); // e3*s3, e1*s1
-        frag_b_h2[2] = __hmul2(frag_b_h2[2], __halves2half2(s45.x, s67.x)); // e6*s6, e4*s4
-        frag_b_h2[3] = __hmul2(frag_b_h2[3], __halves2half2(s45.y, s67.y)); // e7*s7, e5*s5
+        // Layout: frag_b_h2[0]=[n4, n0], [1]=[n5, n1], [2]=[n6, n2], [3]=[n7, n3]
+        frag_b_h2[0] = __hmul2(frag_b_h2[0], __halves2half2(S01.x, S45.x)); // n4*s4, n0*s0
+        frag_b_h2[1] = __hmul2(frag_b_h2[1], __halves2half2(S01.y, S45.y)); // n5*s5, n1*s1
+        frag_b_h2[2] = __hmul2(frag_b_h2[2], __halves2half2(S23.x, S67.x)); // n6*s6, n2*s2
+        frag_b_h2[3] = __hmul2(frag_b_h2[3], __halves2half2(S23.y, S67.y)); // n7*s7, n3*s3
         
-        // Store dequantized B to shared
-        #pragma unroll
-        for(int i=0; i<4; i++) sh_b[tid * 4 + i] = *reinterpret_cast<uint32_t*>(&frag_b_h2[i]);
+        // Re-linearize to sh_b: sh_b[r*4 + 0] = [n1, n0], [1] = [n3, n2], [2] = [n5, n4], [3] = [n7, n6]
+        sh_b[tid * 4 + 0] = __halves2half2(frag_b_h2[0].x, frag_b_h2[1].x);
+        sh_b[tid * 4 + 1] = __halves2half2(frag_b_h2[2].x, frag_b_h2[3].x);
+        sh_b[tid * 4 + 2] = __halves2half2(frag_b_h2[0].y, frag_b_h2[1].y);
+        sh_b[tid * 4 + 3] = __halves2half2(frag_b_h2[2].y, frag_b_h2[3].y);
     }
     
     __syncwarp();
