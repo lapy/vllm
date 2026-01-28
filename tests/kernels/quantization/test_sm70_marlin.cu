@@ -159,17 +159,18 @@ __global__ void marlin_simulation_kernel(
     // --- STAGE 2: Shared -> Reg (Marlin Loop Body) ---
     
     uint32_t frag_a[4];
-    uint32_t frag_b[4]; 
-    
     ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
     
-    // Load B: 4 registers to cover 16 K-steps (4 uint32s = 8 halves = 16 scalar steps?)
-    // Wait, each m8n8k4 step takes 1 scalar from B. 4 steps = 4 scalars = 2 uint32s.
-    // If we use 4 uint32s, we are providing 8 scalars. 
-    // mma_m16n8k16_sm70 uses B[0], B[1], B[2], B[3].
-    // So we need 4 uint32s.
-    for (int i = 0; i < 4; i++) {
-        frag_b[i] = sh_b[(tid * 4 + i) % 64];
+    // B Fragment Distribution: All threads T0,8,16,24 handle Column 0.
+    // Each thread provides 8 uint32_t (16 halves) for its column.
+    uint32_t frag_b[8];
+    int col_idx = tid % 8;
+    for (int r = 0; r < 16; r++) {
+        half* b_h = reinterpret_cast<half*>(&sh_b[r * 4]);
+        half val = b_h[col_idx];
+        half2* b2 = reinterpret_cast<half2*>(frag_b);
+        if (r % 2 == 0) b2[r/2].x = val;
+        else           b2[r/2].y = val;
     }
     
     // --- STAGE 3: Compute ---
@@ -223,15 +224,38 @@ __global__ void marlin_simulation_looped_kernel(
         __syncwarp(); 
 
         // --- STAGE 2: Shared -> Reg ---
+        // A Fragment Distribution (already handled by ldmatrix emulation shuffles)
         uint32_t frag_a[4];
-        uint32_t frag_b[4];
-        
         ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
         
-        // Load 4 B registers
-        for (int i = 0; i < 4; i++) {
-            frag_b[i] = sh_b[(tid * 4 + i) % 64];
+        // B Fragment Distribution for m8n8k4 building block:
+        // Lane T (0..31) provides elements for Column T%8.
+        // Columns 0..7 are covered.
+        // Each T should have all 16 rows for its column? No, 4 registers = 8 halves total.
+        // Wait, mma_m16n8k16_sm70 loops k_idx=0..3.
+        // k0 needs Rows 0..3, k1 needs Rows 4..7, k2: 8..11, k3: 12..15.
+        // Total 16 halves per thread column.
+
+        uint32_t frag_b[8]; // Need 8 uint32 for full 16 halves
+        int col_idx = tid % 8;
+        // Host B is row-major 16x8.
+        // Element B[row, col] is in sh_b[row * 4 + col/2].
+        for (int r = 0; r < 16; r++) {
+            half* b_h = reinterpret_cast<half*>(&sh_b[r * 4]);
+            half val = b_h[col_idx];
+            // Pack into frag_b 
+            // frag_b[r/2] is uint32 (2 halves). 
+            // r%2 == 0 -> low, else high
+            half2* b2 = reinterpret_cast<half2*>(frag_b);
+            if (r % 2 == 0) {
+                b2[r/2].x = val;
+            } else {
+                b2[r/2].y = val;
+            }
         }
+        
+        // Final sanity check: duplicate elements if redundancy needed in B? 
+        // No, current mma_m16n8k16_sm70 uses FragB[k*2] and [k*2+1] which is exactly rows 4k..4k+3.
 
         // --- STAGE 3: Compute ---
         // Accumulate into frag_c
