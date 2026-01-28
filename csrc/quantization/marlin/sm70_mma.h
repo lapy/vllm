@@ -348,15 +348,14 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
         // Logic for extracting 4 K-vals from transposed B:
         uint32_t rb0, rb1;
         if (k_idx < 2) {
-            rb0 = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[0] >> (k_idx*16)) & 0xFFFF)),
-                                 __ushort_as_half(static_cast<unsigned short>((B2[0] >> (k_idx*16)) & 0xFFFF)));
-            // Wait, this only gives 2 halves. m8n8k4 needs 4.
-            // Transposed B usually means K is fast-moving.
-            // This is complex. For now we use same reg twice as legacy did (brokenly).
+            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[0] >> (k_idx*16)) & 0xFFFF)),
+                                       __ushort_as_half(static_cast<unsigned short>((B2[0] >> (k_idx*16)) & 0xFFFF)));
+            rb0 = *reinterpret_cast<uint32_t*>(&res);
             rb1 = rb0; 
         } else {
-            rb0 = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[1] >> ((k_idx-2)*16)) & 0xFFFF)),
-                                 __ushort_as_half(static_cast<unsigned short>((B2[1] >> ((k_idx-2)*16)) & 0xFFFF)));
+            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[1] >> ((k_idx-2)*16)) & 0xFFFF)),
+                                       __ushort_as_half(static_cast<unsigned short>((B2[1] >> ((k_idx-2)*16)) & 0xFFFF)));
+            rb0 = *reinterpret_cast<uint32_t*>(&res);
             rb1 = rb0;
         }
 
