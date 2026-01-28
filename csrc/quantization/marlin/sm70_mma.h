@@ -294,7 +294,7 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
     #pragma unroll
     for (int k = 0; k < 4; k++) {
         // --- Step 1: Prepare A ---
-        // Row r piezas are in T(r%8 + 16*(r/8)) and T(r%8 + 16*(r/8) + 8).
+        // Row r pieces are in T(r%8 + 16*(r/8)) and T(r%8 + 16*(r/8) + 8).
         // Piece k=0,1 (K=0-7). Piece k=2,3 (K=8-15).
         int k_part = (k / 2);
         // A indices: A[0..3] rows 0-7, A[4..7] rows 8-15
@@ -304,17 +304,20 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
         uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + k_part * 8);
 
         // --- Step 2: Prepare B ---
-        // Column j has 16 K-rows across FragB[0..7]. Shuffle the needed 4-K chunk.
-        uint32_t b_val = __shfl_sync(FULL_MASK, B[k], tid / 4);
+        // Each thread already holds its column's K-rows in B[0..7].
+        // B[k] contains halves for K=2k..2k+1 for this thread's column.
+        // Use thread-local B directly (no shuffle needed).
+        uint32_t b0 = B[k * 2];
+        uint32_t b1 = B[k * 2 + 1];
 
         // --- Step 3: Compute and Partition ---
         float c_step_t[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_t, a1_t, b_val, b_val, c_step_t); 
+        mma_m8n8k4_sm70(a0_t, a1_t, b0, b1, c_step_t); 
         frag_c[0] += c_step_t[col_pair * 2 + 0];
         frag_c[1] += c_step_t[col_pair * 2 + 1];
 
         float c_step_b[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_b, a1_b, b_val, b_val, c_step_b);
+        mma_m8n8k4_sm70(a0_b, a1_b, b0, b1, c_step_b);
         frag_c[2] += c_step_b[col_pair * 2 + 0];
         frag_c[3] += c_step_b[col_pair * 2 + 1];
     }
@@ -326,31 +329,32 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
     int tid = threadIdx.x % 32;
     int col_pair = tid % 4;
     #pragma unroll
-    for (int k = 0; k < 2; k++) { // Transposed only has K=8?
-        uint32_t a0_t = __shfl_sync(FULL_MASK, A[k * 2 + 0], (tid % 8));
-        uint32_t a1_t = __shfl_sync(FULL_MASK, A[k * 2 + 1], (tid % 8));
-        uint32_t a0_b = __shfl_sync(FULL_MASK, A[k * 2 + 4], (tid % 8) + 16);
-        uint32_t a1_b = __shfl_sync(FULL_MASK, A[k * 2 + 5], (tid % 8) + 16);
+    for (int k = 0; k < 4; k++) {
+        int k_part = (k / 2);
+        uint32_t a0_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 0], (tid % 8) + k_part * 8);
+        uint32_t a1_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 1], (tid % 8) + k_part * 8);
+        uint32_t a0_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 4], (tid % 8) + 16 + k_part * 8);
+        uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + k_part * 8);
         
-        uint32_t b0;
-        if (k == 0) {
-            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[0]) & 0xFFFF)),
-                                       __ushort_as_half(static_cast<unsigned short>((B2[0]) & 0xFFFF)));
-            b0 = *reinterpret_cast<uint32_t*>(&res);
+        // B is transposed, extract from packed format
+        uint32_t b0, b1;
+        if (k < 2) {
+            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[0] >> (k*16)) & 0xFFFF)),
+                                       __ushort_as_half(static_cast<unsigned short>((B2[0] >> (k*16)) & 0xFFFF)));
+            b0 = *reinterpret_cast<uint32_t*>(&res); b1 = b0;
         } else {
-            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[0] >> 16) & 0xFFFF)),
-                                       __ushort_as_half(static_cast<unsigned short>((B2[0] >> 16) & 0xFFFF)));
-            b0 = *reinterpret_cast<uint32_t*>(&res);
+            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[1] >> ((k-2)*16)) & 0xFFFF)),
+                                       __ushort_as_half(static_cast<unsigned short>((B2[1] >> ((k-2)*16)) & 0xFFFF)));
+            b0 = *reinterpret_cast<uint32_t*>(&res); b1 = b0;
         }
-        b0 = __shfl_sync(FULL_MASK, b0, tid / 4);
 
         float c_step_t[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_t, a1_t, b0, b0, c_step_t);
+        mma_m8n8k4_sm70(a0_t, a1_t, b0, b1, c_step_t);
         frag_c[0] += c_step_t[col_pair * 2 + 0];
         frag_c[1] += c_step_t[col_pair * 2 + 1];
 
         float c_step_b[8] = {0,0,0,0,0,0,0,0};
-        mma_m8n8k4_sm70(a0_b, a1_b, b0, b0, c_step_b);
+        mma_m8n8k4_sm70(a0_b, a1_b, b0, b1, c_step_b);
         frag_c[2] += c_step_b[col_pair * 2 + 0];
         frag_c[3] += c_step_b[col_pair * 2 + 1];
     }
@@ -363,21 +367,24 @@ __device__ void mma_m16n8k16_sm70_fp16(
     int col_pair = tid % 4;
     #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint32_t a0_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 0], (tid % 8) + (k / 2) * 8);
-        uint32_t a1_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 1], (tid % 8) + (k / 2) * 8);
-        uint32_t a0_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 4], (tid % 8) + 16 + (k / 2) * 8);
-        uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + (k / 2) * 8);
-        uint32_t col_b = __shfl_sync(FULL_MASK, B[k], (tid / 4) * 4);
+        int k_part = (k / 2);
+        uint32_t a0_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 0], (tid % 8) + k_part * 8);
+        uint32_t a1_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 1], (tid % 8) + k_part * 8);
+        uint32_t a0_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 4], (tid % 8) + 16 + k_part * 8);
+        uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + k_part * 8);
+        // Use thread-local B (no shuffle)
+        uint32_t b0 = B[k * 2];
+        uint32_t b1 = B[k * 2 + 1];
 
         uint32_t c_step_t[4] = {0,0,0,0};
-        mma_m8n8k4_sm70_fp16(a0_t, a1_t, col_b, col_b, c_step_t);
+        mma_m8n8k4_sm70_fp16(a0_t, a1_t, b0, b1, c_step_t);
         half2 res_t = *reinterpret_cast<half2*>(&c_step_t[col_pair]);
         half2 cur_t = *reinterpret_cast<half2*>(&frag_c[0]);
         cur_t = __hadd2(cur_t, res_t);
         frag_c[0] = *reinterpret_cast<uint32_t*>(&cur_t);
 
         uint32_t c_step_b[4] = {0,0,0,0};
-        mma_m8n8k4_sm70_fp16(a0_b, a1_b, col_b, col_b, c_step_b);
+        mma_m8n8k4_sm70_fp16(a0_b, a1_b, b0, b1, c_step_b);
         half2 res_b = *reinterpret_cast<half2*>(&c_step_b[col_pair]);
         half2 cur_b = *reinterpret_cast<half2*>(&frag_c[1]);
         cur_b = __hadd2(cur_b, res_b);
