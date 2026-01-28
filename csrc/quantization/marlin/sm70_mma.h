@@ -205,13 +205,22 @@ __device__ void mma_m8n8k4_sm70(
     uint32_t a_val = *reinterpret_cast<const uint32_t*>(&a);
     uint32_t b_val = *reinterpret_cast<const uint32_t*>(&b);
     
-    // SM70 m8n8k4 outputs 4 meaningful values (not 8)
-    // The PTX instruction requires exactly 4 output registers for this simplified variant
+    float c_ext[8];
+    c_ext[0] = c0; c_ext[1] = c1; c_ext[2] = c2; c_ext[3] = c3;
+    c_ext[4] = 0.0f; c_ext[5] = 0.0f; c_ext[6] = 0.0f; c_ext[7] = 0.0f;
+
     asm volatile(
         "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-        "{%0, %1, %2, %3}, {%4, %5}, {%6, %7}, {%0, %1, %2, %3};"
-        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
+        "{%0, %1, %2, %3, %4, %5, %6, %7};"
+        : "+f"(c_ext[0]), "+f"(c_ext[1]), "+f"(c_ext[2]), "+f"(c_ext[3]),
+          "+f"(c_ext[4]), "+f"(c_ext[5]), "+f"(c_ext[6]), "+f"(c_ext[7])
         : "r"(a_val), "r"(a_val), "r"(b_val), "r"(b_val));
+
+    c0 = c_ext[0];
+    c1 = c_ext[1];
+    c2 = c_ext[2];
+    c3 = c_ext[3];
 }
 
 
