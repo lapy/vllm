@@ -289,78 +289,94 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
+    int row = tid % 8;
+    int group = tid / 8; // j=0, 1, 2, 3
 
-    // Prepare A/B Fragments for all steps
-    // ldmatrix x4 for m16x16:
-    // T0..7:   A[0]=Col 0,1; A[1]=Col 8,9;   A[2]=R8,Col 0,1; A[3]=R8,Col 8,9
-    // T8..15:  A[0]=Col 2,3; A[1]=Col 10,11; A[2]=R8,Col 2,3; A[3]=R8,Col 10,11
-    // T16..23: A[0]=Col 4,5; A[1]=Col 12,13; A[2]=R8,Col 4,5; A[3]=R8,Col 12,13
-    // T24..31: A[0]=Col 6,7; A[1]=Col 14,15; A[2]=R8,Col 6,7; A[3]=R8,Col 14,15
-
-    for (int k_idx = 0; k_idx < 4; k_idx++) {
-        // Step k=0: K=0..3.  Use A[0]+T0 and A[0]+T8
-        // Step k=1: K=4..7.  Use A[0]+T16 and A[0]+T24
-        // Step k=2: K=8..11. Use A[1]+T0 and A[1]+T8
-        // Step k=3: K=12..15. Use A[1]+T16 and A[1]+T24
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        // --- Step 1: Prepare A ---
+        // ldmatrix.x4 distributes A columns to groups G0-G3.
+        // For each 4-K chunk, we need to gather the correct columns for m8n8k4.
+        int src_g0 = (k % 2 == 0) ? 0 : 2;
+        int src_g1 = src_g0 + 1;
+        int a_reg = (k < 2) ? 0 : 1;
         
-        int a_reg = (k_idx < 2) ? 0 : 1;
-        int t_off0 = (k_idx % 2 == 0) ? 0 : 16;
-        int t_off1 = t_off0 + 8;
+        // Broadcast A for Top (Rows 0-7) and Bottom (Rows 8-15)
+        uint32_t a0_t = __shfl_sync(FULL_MASK, A[a_reg], row + src_g0 * 8);
+        uint32_t a1_t = __shfl_sync(FULL_MASK, A[a_reg], row + src_g1 * 8);
+        uint32_t a0_b = __shfl_sync(FULL_MASK, A[a_reg + 2], row + src_g0 * 8);
+        uint32_t a1_b = __shfl_sync(FULL_MASK, A[a_reg + 2], row + src_g1 * 8);
         
-        uint32_t ra0_t = __shfl_sync(FULL_MASK, A[a_reg], tid % 8 + t_off0);
-        uint32_t ra1_t = __shfl_sync(FULL_MASK, A[a_reg], tid % 8 + t_off1);
+        // --- Step 2: Prepare B ---
+        // Each thread holds its column for all 16 K-rows.
+        uint32_t b0 = B[k * 2];
+        uint32_t b1 = B[k * 2 + 1];
         
-        uint32_t ra0_b = __shfl_sync(FULL_MASK, A[a_reg + 2], tid % 8 + t_off0);
-        uint32_t ra1_b = __shfl_sync(FULL_MASK, A[a_reg + 2], tid % 8 + t_off1);
+        // --- Step 3: Execute Hardware Matrix Multiply-Accumulate ---
+        // Row 0-7
+        float c_step_t[8] = {0,0,0,0,0,0,0,0};
+        c_step_t[group * 2 + 0] = frag_c[0];
+        c_step_t[group * 2 + 1] = frag_c[1];
+        mma_m8n8k4_sm70(a0_t, a1_t, b0, b1, c_step_t);
+        frag_c[0] = c_step_t[group * 2 + 0];
+        frag_c[1] = c_step_t[group * 2 + 1];
         
-        // B Operand: B[k_idx*2] and B[k_idx*2 + 1] provide K=[4k..4k+3] for this thread's column.
-        // Update: B from Marlin loop is provided redundant (T0, 8, 16, 24 have same).
-        uint32_t rb0 = B[k_idx * 2];
-        uint32_t rb1 = B[k_idx * 2 + 1];
-
-        mma_m16n8k16_step_float(frag_c, false, ra0_t, ra1_t, rb0, rb1);
-        mma_m16n8k16_step_float(frag_c, true,  ra0_b, ra1_b, rb0, rb1);
+        // Row 8-15
+        float c_step_b[8] = {0,0,0,0,0,0,0,0};
+        c_step_b[group * 2 + 0] = frag_c[2];
+        c_step_b[group * 2 + 1] = frag_c[3];
+        mma_m8n8k4_sm70(a0_b, a1_b, b0, b1, c_step_b);
+        frag_c[2] = c_step_b[group * 2 + 0];
+        frag_c[3] = c_step_b[group * 2 + 1];
     }
 }
-
-
 
 // =============================================================================
 // Transposed B variants
 // =============================================================================
 
-// Per-thread fragment API with transposed B layout
 __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
                                         const uint32_t* B2, float* frag_c) {
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
+    int row = tid % 8;
+    int group = tid / 8;
 
-    for (int k_idx = 0; k_idx < 4; k_idx++) {
-        int a_reg = (k_idx < 2) ? 0 : 1;
-        int t_off0 = (k_idx % 2 == 0) ? 0 : 16;
-        int t_off1 = t_off0 + 8;
-        uint32_t ra0_t = __shfl_sync(FULL_MASK, A[a_reg], tid % 8 + t_off0);
-        uint32_t ra1_t = __shfl_sync(FULL_MASK, A[a_reg], tid % 8 + t_off1);
-        uint32_t ra0_b = __shfl_sync(FULL_MASK, A[a_reg + 2], tid % 8 + t_off0);
-        uint32_t ra1_b = __shfl_sync(FULL_MASK, A[a_reg + 2], tid % 8 + t_off1);
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int src_g0 = (k % 2 == 0) ? 0 : 2;
+        int src_g1 = src_g0 + 1;
+        int a_reg = (k < 2) ? 0 : 1;
+        uint32_t a0_t = __shfl_sync(FULL_MASK, A[a_reg], row + src_g0 * 8);
+        uint32_t a1_t = __shfl_sync(FULL_MASK, A[a_reg], row + src_g1 * 8);
+        uint32_t a0_b = __shfl_sync(FULL_MASK, A[a_reg + 2], row + src_g0 * 8);
+        uint32_t a1_b = __shfl_sync(FULL_MASK, A[a_reg + 2], row + src_g1 * 8);
         
-        // Transposed B bits: B[0] has K0, B2[0] has K0? 
-        // Logic for extracting 4 K-vals from transposed B:
-        uint32_t rb0, rb1;
-        if (k_idx < 2) {
-            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[0] >> (k_idx*16)) & 0xFFFF)),
-                                       __ushort_as_half(static_cast<unsigned short>((B2[0] >> (k_idx*16)) & 0xFFFF)));
-            rb0 = *reinterpret_cast<uint32_t*>(&res);
-            rb1 = rb0; 
+        // Transposed B extraction logic (already extracts 4 K-vals)
+        uint32_t b0, b1;
+        if (k < 2) {
+            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[0] >> (k*16)) & 0xFFFF)),
+                                       __ushort_as_half(static_cast<unsigned short>((B2[0] >> (k*16)) & 0xFFFF)));
+            b0 = *reinterpret_cast<uint32_t*>(&res); b1 = b0; 
         } else {
-            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[1] >> ((k_idx-2)*16)) & 0xFFFF)),
-                                       __ushort_as_half(static_cast<unsigned short>((B2[1] >> ((k_idx-2)*16)) & 0xFFFF)));
-            rb0 = *reinterpret_cast<uint32_t*>(&res);
-            rb1 = rb0;
+            half2 res = __halves2half2(__ushort_as_half(static_cast<unsigned short>((B[1] >> ((k-2)*16)) & 0xFFFF)),
+                                       __ushort_as_half(static_cast<unsigned short>((B2[1] >> ((k-2)*16)) & 0xFFFF)));
+            b0 = *reinterpret_cast<uint32_t*>(&res); b1 = b0;
         }
 
-        mma_m16n8k16_step_float(frag_c, false, ra0_t, ra1_t, rb0, rb1);
-        mma_m16n8k16_step_float(frag_c, true,  ra0_b, ra1_b, rb0, rb1);
+        float c_step_t[8] = {0,0,0,0,0,0,0,0};
+        c_step_t[group * 2 + 0] = frag_c[0];
+        c_step_t[group * 2 + 1] = frag_c[1];
+        mma_m8n8k4_sm70(a0_t, a1_t, b0, b1, c_step_t);
+        frag_c[0] = c_step_t[group * 2 + 0];
+        frag_c[1] = c_step_t[group * 2 + 1];
+        
+        float c_step_b[8] = {0,0,0,0,0,0,0,0};
+        c_step_b[group * 2 + 0] = frag_c[2];
+        c_step_b[group * 2 + 1] = frag_c[3];
+        mma_m8n8k4_sm70(a0_b, a1_b, b0, b1, c_step_b);
+        frag_c[2] = c_step_b[group * 2 + 0];
+        frag_c[3] = c_step_b[group * 2 + 1];
     }
 }
 
@@ -368,32 +384,44 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
 // FP16 accumulation variants
 // =============================================================================
 
-// Per-thread fragment API: A[4], B[8], frag_c[4] (FragC for fp16 is 4x half2).
 __device__ void mma_m16n8k16_sm70_fp16(
     const uint32_t* A, const uint32_t* B, uint32_t* frag_c) {
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
+    int row = tid % 8;
+    int group = tid / 8;
 
-    for (int k_idx = 0; k_idx < 4; k_idx++) {
-        int a_reg = (k_idx < 2) ? 0 : 1;
-        int t_off0 = (k_idx % 2 == 0) ? 0 : 16;
-        int t_off1 = t_off0 + 8;
-        uint32_t ra0_t = __shfl_sync(FULL_MASK, A[a_reg], tid % 8 + t_off0);
-        uint32_t ra1_t = __shfl_sync(FULL_MASK, A[a_reg], tid % 8 + t_off1);
-        uint32_t ra0_b = __shfl_sync(FULL_MASK, A[a_reg + 2], tid % 8 + t_off0);
-        uint32_t ra1_b = __shfl_sync(FULL_MASK, A[a_reg + 2], tid % 8 + t_off1);
-        uint32_t rb0 = B[k_idx * 2];
-        uint32_t rb1 = B[k_idx * 2 + 1];
-        mma_m16n8k16_step_fp16(frag_c, false, ra0_t, ra1_t, rb0, rb1);
-        mma_m16n8k16_step_fp16(frag_c, true,  ra0_b, ra1_b, rb0, rb1);
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        int src_g0 = (k % 2 == 0) ? 0 : 2;
+        int src_g1 = src_g0 + 1;
+        int a_reg = (k < 2) ? 0 : 1;
+        uint32_t a0_t = __shfl_sync(FULL_MASK, A[a_reg], row + src_g0 * 8);
+        uint32_t a1_t = __shfl_sync(FULL_MASK, A[a_reg], row + src_g1 * 8);
+        uint32_t a0_b = __shfl_sync(FULL_MASK, A[a_reg + 2], row + src_g0 * 8);
+        uint32_t a1_b = __shfl_sync(FULL_MASK, A[a_reg + 2], row + src_g1 * 8);
+        uint32_t b0 = B[k * 2];
+        uint32_t b1 = B[k * 2 + 1];
+
+        uint32_t c_step_t[4] = {0,0,0,0};
+        c_step_t[group * 2 + 0] = frag_c[0];
+        c_step_t[group * 2 + 1] = frag_c[1];
+        mma_m8n8k4_sm70_fp16(a0_t, a1_t, b0, b1, c_step_t);
+        frag_c[0] = c_step_t[group * 2 + 0];
+        frag_c[1] = c_step_t[group * 2 + 1];
+        
+        uint32_t c_step_b[4] = {0,0,0,0};
+        c_step_b[group * 2 + 0] = frag_c[2];
+        c_step_b[group * 2 + 1] = frag_c[3];
+        mma_m8n8k4_sm70_fp16(a0_b, a1_b, b0, b1, c_step_b);
+        frag_c[2] = c_step_b[group * 2 + 0];
+        frag_c[3] = c_step_b[group * 2 + 1];
     }
 }
 
 // =============================================================================
-// 16x8x32 MMA operations (composed from 2x m16n8k16)
+// Higher-dimensional MMA operations (composed)
 // =============================================================================
-
-
 
 // Per-thread fragment API: A[8], B[4], frag_c[4]. Two 16x8x16 steps.
 __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
@@ -401,7 +429,5 @@ __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
     mma_m16n8k16_sm70(A, B, frag_c);
     mma_m16n8k16_sm70(A + 4, B + 8, frag_c);
 }
-
-
 
 } // namespace MARLIN_NAMESPACE_NAME

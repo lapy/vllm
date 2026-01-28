@@ -96,10 +96,10 @@ __global__ void test_mma_m16n8k16_kernel(const uint32_t* A, const uint32_t* B, f
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
-    C[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
-    C[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
-    C[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
+    C[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
+    C[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
+    C[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
+    C[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
 }
 
 __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t* B, const uint32_t* B2, float* C) {
@@ -110,10 +110,10 @@ __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
-    C[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
-    C[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
-    C[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
+    C[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
+    C[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
+    C[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
+    C[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
 }
 
 __global__ void test_ldmatrix_kernel(const uint32_t* input, uint32_t* output) {
@@ -177,15 +177,14 @@ __global__ void marlin_simulation_kernel(
     // --- STAGE 2: Shared -> Reg (Marlin Loop Body) ---
     
     uint32_t frag_a[4];
-    ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
+    int a_row_off = (tid % 8) + (tid / 16) * 8;
+    int a_col_off = ((tid / 8) % 2) * 4;
+    ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[a_row_off * 8 + a_col_off]);
     
-    // B Fragment Distribution: All threads T0,8,16,24 handle Column 0.
-    // Each thread provides 8 uint32_t (16 halves) for its column.
     uint32_t frag_b[8];
-    int col_idx = tid % 8;
+    half* sh_b_h = reinterpret_cast<half*>(sh_b);
     for (int r = 0; r < 16; r++) {
-        half* b_h = reinterpret_cast<half*>(&sh_b[r * 4]);
-        half val = b_h[col_idx];
+        half val = sh_b_h[r * 8 + (tid % 8)];
         half2* b2 = reinterpret_cast<half2*>(frag_b);
         if (r % 2 == 0) b2[r/2].x = val;
         else           b2[r/2].y = val;
@@ -200,10 +199,10 @@ __global__ void marlin_simulation_kernel(
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C_global[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
-    C_global[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
-    C_global[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
-    C_global[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
+    C_global[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
+    C_global[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
+    C_global[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
+    C_global[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
 }
 
 // =============================================================================
@@ -262,22 +261,13 @@ __global__ void marlin_simulation_looped_kernel(
         // k0 needs Rows 0..3, k1 needs Rows 4..7, k2: 8..11, k3: 12..15.
         // Total 16 halves per thread column.
 
-        uint32_t frag_b[8]; // Need 8 uint32 for full 16 halves
-        int col_idx = tid % 8;
-        // Host B is row-major 16x8.
-        // Element B[row, col] is in sh_b[row * 4 + col/2].
+        uint32_t frag_b[8];
+        half* sh_b_h = reinterpret_cast<half*>(sh_b);
         for (int r = 0; r < 16; r++) {
-            half* b_h = reinterpret_cast<half*>(&sh_b[r * 4]);
-            half val = b_h[col_idx];
-            // Pack into frag_b 
-            // frag_b[r/2] is uint32 (2 halves). 
-            // r%2 == 0 -> low, else high
+            half val = sh_b_h[r * 8 + (tid % 8)];
             half2* b2 = reinterpret_cast<half2*>(frag_b);
-            if (r % 2 == 0) {
-                b2[r/2].x = val;
-            } else {
-                b2[r/2].y = val;
-            }
+            if (r % 2 == 0) b2[r/2].x = val;
+            else           b2[r/2].y = val;
         }
         
         // Final sanity check: duplicate elements if redundancy needed in B? 
@@ -294,10 +284,10 @@ __global__ void marlin_simulation_looped_kernel(
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C_global[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
-    C_global[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
-    C_global[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
-    C_global[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
+    C_global[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
+    C_global[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
+    C_global[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
+    C_global[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
 }
 
 // -----------------------------------------------------------------------------
@@ -368,12 +358,10 @@ __global__ void marlin_simulation_dequant_kernel(
     int a_col_off = ((tid / 8) % 2) * 4;
     ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[a_row_off * 8 + a_col_off]);
     
-    // FragB size 8 is REQUIRED for SM70 mma_m16n8k16
     uint32_t frag_b[8];
-    int col_idx = tid % 8;
+    half* sh_b_h = reinterpret_cast<half*>(sh_b);
     for (int r = 0; r < 16; r++) {
-        half* b_h = reinterpret_cast<half*>(&sh_b[r * 4]);
-        half val = b_h[col_idx];
+        half val = sh_b_h[r * 8 + (tid % 8)];
         half2* b2 = reinterpret_cast<half2*>(frag_b);
         if (r % 2 == 0) b2[r/2].x = val;
         else           b2[r/2].y = val;
@@ -385,10 +373,10 @@ __global__ void marlin_simulation_dequant_kernel(
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C_global[(core_row + 0) * 8 + (core_col_base + 0)] = frag_c[0];
-    C_global[(core_row + 0) * 8 + (core_col_base + 4)] = frag_c[1];
-    C_global[(core_row + 8) * 8 + (core_col_base + 0)] = frag_c[2];
-    C_global[(core_row + 8) * 8 + (core_col_base + 4)] = frag_c[3];
+    C_global[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
+    C_global[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
+    C_global[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
+    C_global[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
 }
 
 // Host reference for 4-bit dequantization (GPTQ style)
@@ -590,7 +578,7 @@ bool test_mma_random_numerical() {
     // Copy first 32*8 uint32s from B_packed to d_B
     cudaMemcpy(d_B, B_packed.data(), 32*8*sizeof(uint32_t), cudaMemcpyHostToDevice);
     
-    test_mma_m16n8k16_kernel<<<1, 32>>>(d_A, d_B, d_C);
+    marlin_simulation_kernel<<<1, 32>>>(d_A, d_B, d_C);
     CUDA_CHECK(cudaGetLastError());
     
     std::vector<float> C_out(M*N);
@@ -890,7 +878,7 @@ bool test_mma_correctness() {
     cudaMemcpy(d_A, A_packed.data(), size_A_bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, B_packed.data(), size_B_bytes, cudaMemcpyHostToDevice);
     
-    test_mma_m16n8k16_kernel<<<1, 32>>>(d_A, d_B, d_C);
+    marlin_simulation_kernel<<<1, 32>>>(d_A, d_B, d_C);
     
     std::vector<float> C_out(32*4);
     cudaMemcpy(C_out.data(), d_C, 32 * 4 * sizeof(float), cudaMemcpyDeviceToHost);
