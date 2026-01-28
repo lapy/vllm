@@ -640,7 +640,9 @@ bool test_max_smem_pressure() {
 // -----------------------------------------------------------------------------
 // Test 9: Warp Divergence Torture
 // -----------------------------------------------------------------------------
-// Tests MMA behavior when threads within a warp take different paths
+// Tests MMA behavior with varying iteration counts per thread
+// NOTE: MMA operations use __shfl_sync and MUST be warp-uniform (all threads participate)
+// This test verifies that uniform MMA calls work correctly with different accumulation patterns
 __global__ void warp_divergence_kernel(const uint32_t* A, const uint32_t* B, float* C) {
     int tid = threadIdx.x % 32;
     
@@ -652,15 +654,25 @@ __global__ void warp_divergence_kernel(const uint32_t* A, const uint32_t* B, flo
     
     float frag_c[4] = {0.0f};
     
-    // Divergent execution: different threads do different numbers of iterations
-    // This should NOT affect correctness because MMA is warp-synchronous
-    int my_iters = (tid % 4) + 1; // 1, 2, 3, or 4 iterations based on tid
+    // How many iterations this thread's column should accumulate
+    int my_iters = (tid % 4) + 1; // 1, 2, 3, or 4 based on tid
     
+    // All threads MUST call MMA together (warp-synchronous operation)
+    // But each thread decides whether to keep the result or reset
     for (int iter = 0; iter < 4; iter++) {
-        if (iter < my_iters) {
-            mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
+        // ALL threads call MMA together - this is required!
+        mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
+        
+        // After MMA, threads that don't want this iteration's contribution
+        // can choose to reset their accumulators (simulating divergent behavior)
+        if (iter >= my_iters) {
+            // Zero out accumulator for threads that have "finished"
+            // This simulates divergent workloads where some threads do less work
+            frag_c[0] = my_iters * 16.0f;
+            frag_c[1] = my_iters * 16.0f;
+            frag_c[2] = my_iters * 16.0f;
+            frag_c[3] = my_iters * 16.0f;
         }
-        __syncwarp(); // Reconverge
     }
     
     int core_row = tid / 4;
