@@ -344,20 +344,9 @@ __global__ void marlin_simulation_dequant_kernel(
 
     // --- STAGE 3: Compute with Swizzled A ---
     uint32_t frag_a[4];
-    // ldmatrix must use swizzled pointer
-    // In actual kernel, pointers are pre-swizzled.
-    // For this test, we just pass the base and let it shuffle.
-    // Wait, ldmatrix_sm70 uses smem_ptr and assumes it knows the row layout.
-    // If we swizzled the WRITE, we must unswizzle the READ or use the same XOR.
-    
-    // Let's use a simpler swizzle verification: 
-    // Just verify that we can load from a swizzled buffer and get the right values.
-    
-    // For simplicity, let's keep the math but disable swizzle in the final MMA call if it's too complex to replicate.
-    // Actually, Marlin's transform_a is for bank conflicts, MMA then expects standard fragments.
-    
     ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
     
+    // FragB size 8 is REQUIRED for SM70 mma_m16n8k16
     uint32_t frag_b[8];
     int col_idx = tid % 8;
     for (int r = 0; r < 16; r++) {
@@ -376,25 +365,62 @@ __global__ void marlin_simulation_dequant_kernel(
     }
 }
 
+// Host reference for 4-bit dequantization (GPTQ style)
+void dequantize_gptq_int4_host(
+    half* out,               // [K, N] half
+    const uint32_t* B_quant, // [K, N/8] uint32
+    const half* scales,      // [1, N] half
+    int K, int N
+) {
+    for (int k = 0; k < K; k++) {
+        for (int n = 0; n < N; n++) {
+            int q_idx = k * (N/8) + (n/8);
+            uint32_t q_val = B_quant[q_idx];
+            int shift = (n % 8) * 4;
+            float q = static_cast<float>((q_val >> shift) & 0xF);
+            
+            // Replicate Marlin dequant logic (U4)
+            // q = (q - 0) * scale? No, U4 is just q * scale if no zero-point.
+            float s = __half2float(scales[n]);
+            out[k * N + n] = __float2half(q * s);
+        }
+    }
+}
+
 bool test_marlin_simulation_dequant() {
-    printf("Running test_marlin_simulation_dequant...\n");
+    printf("Running test_marlin_simulation_dequant with numerical verification...\n");
     const int M=16, K=16, N=8;
     
-    std::vector<half> A_ref(M*K, __float2half(1.0f));
-    std::vector<uint32_t> B_quant(16, 0x12345678); // Dummy 4-bit values
-    std::vector<half> scales_ref(N, __float2half(0.5f));
+    std::vector<half> A_ref(M*K);
+    std::vector<uint32_t> B_quant(M*N/8); // 16x8 elements -> 128/8 = 16 uint32s
+    std::vector<half> scales_ref(N);
     
+    std::default_random_engine gen(1234);
+    std::uniform_real_distribution<float> dist_a(-1.0, 1.0);
+    std::uniform_int_distribution<uint32_t> dist_b(0, 0xFFFFFFFF);
+    
+    for(int i=0; i<M*K; i++) A_ref[i] = __float2half(dist_a(gen));
+    for(int i=0; i<B_quant.size(); i++) B_quant[i] = dist_b(gen);
+    for(int i=0; i<N; i++) scales_ref[i] = __float2half(0.5f);
+    
+    // 1. CPU Reference
+    std::vector<half> B_dequant_ref(K*N);
+    dequantize_gptq_int4_host(B_dequant_ref.data(), B_quant.data(), scales_ref.data(), K, N);
+    
+    std::vector<float> C_ref(M*N);
+    matmul_cpu(A_ref.data(), B_dequant_ref.data(), C_ref.data(), M, N, K);
+    
+    // 2. GPU Execution
     uint32_t *dA, *dB, *dS; float *dC;
     cudaMalloc(&dA, M*K*sizeof(half));
-    cudaMalloc(&dB, 16 * sizeof(uint32_t));
-    cudaMalloc(&dS, N * sizeof(half));
+    cudaMalloc(&dB, B_quant.size() * sizeof(uint32_t));
+    cudaMalloc(&dS, N * sizeof(half)); // Actually pack_halves expects enough for uint32s
     cudaMalloc(&dC, M*N * sizeof(float));
     
     std::vector<uint32_t> A_packed(M*K/2);
     pack_halves(A_packed.data(), A_ref.data(), M*K/2);
-    
     cudaMemcpy(dA, A_packed.data(), M*K*sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B_quant.data(), 16 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_quant.data(), B_quant.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
     
     std::vector<uint32_t> S_packed(N/2);
     pack_halves(S_packed.data(), scales_ref.data(), N/2);
@@ -408,16 +434,21 @@ bool test_marlin_simulation_dequant() {
     
     cudaFree(dA); cudaFree(dB); cudaFree(dS); cudaFree(dC);
     
-    // Check if result is non-zero (dequant + math worked)
-    bool has_data = false;
-    for(float f : C_out) if(abs(f) > 0.001f) has_data = true;
+    // 3. Precision Check
+    float max_err = 0;
+    for(int i=0; i<M*N; i++) {
+        float err = abs(C_out[i] - C_ref[i]);
+        if(err > max_err) max_err = err;
+    }
     
-    if(!has_data) {
-        printf("FAILED: Output is zero\n");
+    printf("  Max absolute error: %f\n", max_err);
+    
+    if(max_err > 0.01f) {
+        printf("FAILED: Numerical discrepancy too high\n");
         return false;
     }
     
-    printf("PASSED (Dequant + Swizzle simulation successful)\n");
+    printf("PASSED (Dequant + Swizzle simulation numerically correct)\n");
     return true;
 }
 
