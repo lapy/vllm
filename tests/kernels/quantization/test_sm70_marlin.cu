@@ -90,30 +90,36 @@ void matmul_cpu(const half* A, const half* B, float* C, int M, int N, int K) {
 __global__ void test_mma_m16n8k16_kernel(const uint32_t* A, const uint32_t* B, float* C) {
     int tid = threadIdx.x % 32;
     float frag_c[4] = {0.0f};
-    mma_m16n8k16_sm70(A + tid * 4, B + tid * 8, frag_c);
+    mma_m16n8k16_sm70(A + tid * 8, B + tid * 8, frag_c);
     
     // Store outputs using correct FragC layout for SM70 (16x8 block)
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
-    C[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
-    C[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
-    C[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
 }
 
 __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t* B, const uint32_t* B2, float* C) {
     int tid = threadIdx.x % 32;
     float frag_c[4] = {0.0f};
-    mma_m16n8k16_sm70_trans(A + tid * 4, B + tid * 2, B2 + tid * 2, frag_c);
+    mma_m16n8k16_sm70_trans(A + tid * 8, B + tid * 2, B2 + tid * 2, frag_c);
     
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
-    C[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
-    C[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
-    C[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
 }
 
 __global__ void test_ldmatrix_kernel(const uint32_t* input, uint32_t* output) {
@@ -175,12 +181,14 @@ __global__ void marlin_simulation_kernel(
     __syncwarp(); // Barrier for "cp_async_wait"
 
     // --- STAGE 2: Shared -> Reg (Marlin Loop Body) ---
-    
-    uint32_t frag_a[4];
+    uint32_t frag_a[8]; // K=16 needs 8 registers for A
     int a_row_off = (tid % 8) + (tid / 16) * 8;
     int a_col_off = ((tid / 8) % 2) * 4;
-    ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[a_row_off * 8 + a_col_off]);
-    
+    // Load K=0..7
+    ldmatrix_m8n8_x4_sm70(&frag_a[0], &sh_a[a_row_off * 8 + a_col_off]);
+    // Load K=8..15
+    ldmatrix_m8n8_x4_sm70(&frag_a[4], &sh_a[a_row_off * 8 + a_col_off + 4]); // Offset by 8 halves
+
     uint32_t frag_b[8];
     half* sh_b_h = reinterpret_cast<half*>(sh_b);
     for (int r = 0; r < 16; r++) {
@@ -199,10 +207,14 @@ __global__ void marlin_simulation_kernel(
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C_global[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
-    C_global[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
-    C_global[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
-    C_global[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
+    // Partitioned store: Row = tid/4 + {0, 8}, Col = (tid%4)*2 + {0, 1}
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C_global[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C_global[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C_global[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C_global[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
 }
 
 // =============================================================================
@@ -245,20 +257,9 @@ __global__ void marlin_simulation_looped_kernel(
         __syncwarp(); 
 
         // --- STAGE 2: Shared -> Reg ---
-        // A Fragment Distribution (already handled by ldmatrix emulation shuffles)
-        // ldmatrix emulation
-        uint32_t frag_a[4];
-        // Correct ldmatrix pointer for m8n8.x4 (16x16 block)
+        uint32_t frag_a[8]; 
         int a_row_off = (tid % 8) + (tid / 16) * 8;
         int a_col_off = ((tid / 8) % 2) * 4;
-        ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[a_row_off * 8 + a_col_off]);
-        
-        // B Fragment Distribution for m8n8k4 building block:
-        // Lane T (0..31) provides elements for Column T%8.
-        // Columns 0..7 are covered.
-        // Each T should have all 16 rows for its column? No, 4 registers = 8 halves total.
-        // Wait, mma_m16n8k16_sm70 loops k_idx=0..3.
-        // k0 needs Rows 0..3, k1 needs Rows 4..7, k2: 8..11, k3: 12..15.
         // Total 16 halves per thread column.
 
         uint32_t frag_b[8];
@@ -284,10 +285,14 @@ __global__ void marlin_simulation_looped_kernel(
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C_global[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
-    C_global[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
-    C_global[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
-    C_global[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
+    // Partitioned store: Row = tid/4 + {0, 8}, Col = (tid%4)*2 + {0, 1}
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C_global[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C_global[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C_global[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C_global[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
 }
 
 // -----------------------------------------------------------------------------
@@ -352,11 +357,11 @@ __global__ void marlin_simulation_dequant_kernel(
     __syncthreads();
 
     // --- STAGE 3: Compute with Swizzled A ---
-    uint32_t frag_a[4];
-    // Correct ldmatrix pointer for m8n8.x4 (16x16 block)
+    uint32_t frag_a[8];
     int a_row_off = (tid % 8) + (tid / 16) * 8;
     int a_col_off = ((tid / 8) % 2) * 4;
-    ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[a_row_off * 8 + a_col_off]);
+    ldmatrix_m8n8_x4_sm70(&frag_a[0], &sh_a[a_row_off * 8 + a_col_off]);
+    ldmatrix_m8n8_x4_sm70(&frag_a[4], &sh_a[a_row_off * 8 + a_col_off + 4]);
     
     uint32_t frag_b[8];
     half* sh_b_h = reinterpret_cast<half*>(sh_b);
@@ -373,10 +378,14 @@ __global__ void marlin_simulation_dequant_kernel(
     int core_row = (tid % 8);
     int core_col_base = (tid / 8); 
     
-    C_global[(core_row + 0) * 8 + (2 * core_col_base + 0)] = frag_c[0];
-    C_global[(core_row + 0) * 8 + (2 * core_col_base + 1)] = frag_c[1];
-    C_global[(core_row + 8) * 8 + (2 * core_col_base + 0)] = frag_c[2];
-    C_global[(core_row + 8) * 8 + (2 * core_col_base + 1)] = frag_c[3];
+    // Partitioned store: Row = tid/4 + {0, 8}, Col = (tid%4)*2 + {0, 1}
+    int core_row = tid / 4;
+    int core_col = (tid % 4) * 2;
+    
+    C_global[(core_row + 0) * 8 + core_col + 0] = frag_c[0];
+    C_global[(core_row + 0) * 8 + core_col + 1] = frag_c[1];
+    C_global[(core_row + 8) * 8 + core_col + 0] = frag_c[2];
+    C_global[(core_row + 8) * 8 + core_col + 1] = frag_c[3];
 }
 
 // Host reference for 4-bit dequantization (GPTQ style)
@@ -573,8 +582,8 @@ bool test_mma_random_numerical() {
     // This test is primarily for the MMA instruction itself, assuming correct fragment distribution.
     // The `marlin_simulation_kernel` tests the full pipeline including fragment distribution.
 
-    // Copy first 32*4 uint32s from A_packed to d_A
-    cudaMemcpy(d_A, A_packed.data(), 32*4*sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // Copy first 32*8 uint32s from A_packed to d_A
+    cudaMemcpy(d_A, A_packed.data(), 32*8*sizeof(uint32_t), cudaMemcpyHostToDevice);
     // Copy first 32*8 uint32s from B_packed to d_B
     cudaMemcpy(d_B, B_packed.data(), 32*8*sizeof(uint32_t), cudaMemcpyHostToDevice);
     
