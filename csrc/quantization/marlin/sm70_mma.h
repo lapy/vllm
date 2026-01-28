@@ -225,22 +225,36 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
     // Initialize accumulator to add to existing frag_c values
     float c_local[4] = {frag_c[0], frag_c[1], frag_c[2], frag_c[3]};
     
+    // m16n8k16 = 4 x m8n8k4
+    // A fragment: 8 uint32 per thread (16x16 matrix distributed across 32 threads)
+    // B fragment: 2 uint32 per thread (16x8 matrix, but only 4 halves per thread)
+    //
+    // For each k-step (0..3), we process k=4 elements:
+    //   k=0: columns 0-3, k=1: columns 4-7, k=2: columns 8-11, k=3: columns 12-15
+    // The B data is distributed across threads in groups of 8.
+    // Threads 0-7 hold k=0-3, threads 8-15 hold k=4-7, etc.
+    // We use shuffles to gather the appropriate B slice for each k-step.
+    
     #pragma unroll
     for (int k = 0; k < 4; k++) {
         int k_part = (k / 2);
         // Shuffle A fragments from the appropriate source lanes
+        // A layout: each thread holds portions of rows, need to gather by k-slice
         uint32_t a0_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 0], (tid % 8) + k_part * 8);
         uint32_t a1_t = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 1], (tid % 8) + k_part * 8);
         uint32_t a0_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 4], (tid % 8) + 16 + k_part * 8);
         uint32_t a1_b = __shfl_sync(FULL_MASK, A[(k % 2) * 2 + 5], (tid % 8) + 16 + k_part * 8);
         
         // Shuffle B fragments to get different k-slices from different threads.
-        // Each thread's B[0..1] contains 4 half values. For k=16, we need data
-        // from 4 different "k-groups" of threads.
-        // Source lane = thread in same column but different k-group
+        // B layout: B[0] and B[1] each hold 2 halves.
+        // For k steps 0,2 we use B[0], for k steps 1,3 we use B[1]
+        // Source lane provides data for a different k-slice
         int b_source = (tid % 8) + k_part * 8;
-        uint32_t b0 = __shfl_sync(FULL_MASK, B[k % 2], b_source);
-        uint32_t b1 = __shfl_sync(FULL_MASK, B[(k % 2) + 1], b_source);
+        int b_idx = k % 2;
+        uint32_t b_val = __shfl_sync(FULL_MASK, B[b_idx], b_source);
+        // For m8n8k4, we need 2 B registers - replicate for broadcast
+        uint32_t b0 = b_val;
+        uint32_t b1 = b_val;
 
         // Top 8 rows of output (m = 0..7)
         float c_step_t[8] = {0,0,0,0,0,0,0,0};
