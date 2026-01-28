@@ -88,8 +88,9 @@ void matmul_cpu(const half* A, const half* B, float* C, int M, int N, int K) {
 // =============================================================================
 
 __global__ void test_mma_m16n8k16_kernel(const uint32_t* A, const uint32_t* B, float* C) {
+    int tid = threadIdx.x % 32;
     float frag_c[4] = {0.0f};
-    mma_m16n8k16_sm70(A, B, frag_c);
+    mma_m16n8k16_sm70(A + tid * 4, B + tid * 8, frag_c);
     
     // Store outputs using correct FragC layout for SM70 (16x8 block)
     int tid = threadIdx.x;
@@ -103,8 +104,9 @@ __global__ void test_mma_m16n8k16_kernel(const uint32_t* A, const uint32_t* B, f
 }
 
 __global__ void test_mma_m16n8k16_trans_kernel(const uint32_t* A, const uint32_t* B, const uint32_t* B2, float* C) {
+    int tid = threadIdx.x % 32;
     float frag_c[4] = {0.0f};
-    mma_m16n8k16_sm70_trans(A, B, B2, frag_c);
+    mma_m16n8k16_sm70_trans(A + tid * 4, B + tid * 2, B2 + tid * 2, frag_c);
     
     int tid = threadIdx.x;
     int core_row = (tid % 8);
@@ -725,7 +727,7 @@ bool test_marlin_simulation_looped() {
     cudaMemcpy(dB, B_packed.data(), B_packed.size()*4, cudaMemcpyHostToDevice);
     
     // Launch kernel with large K
-    marlin_simulation_looped_kernel<<<1, 32>>>(dA, dB, dC, K_iters);
+    marlin_simulation_looped_kernel<<<1, 32>>>(dA, dB, dC, K_large);
     CUDA_CHECK(cudaGetLastError());
     
     std::vector<float> C_out(M*N); 
