@@ -2633,8 +2633,8 @@ bool test_mma_random_numerical_large() {
     return all_pass;
 }
 
-// Test ldmatrix functions for correctness
-__global__ void test_ldmatrix_x1_kernel(const uint32_t* input, uint32_t* output) {
+// Test ldmatrix functions for correctness (pattern variant)
+__global__ void test_ldmatrix_x1_pattern_kernel(const uint32_t* input, uint32_t* output) {
     __shared__ uint32_t sh_mem[32];
     
     int tid = threadIdx.x;
@@ -2659,7 +2659,7 @@ bool test_ldmatrix_x1_pattern() {
     
     cudaMemcpy(dIn, input.data(), 32 * sizeof(uint32_t), cudaMemcpyHostToDevice);
     
-    test_ldmatrix_x1_kernel<<<1, 32>>>(dIn, dOut);
+    test_ldmatrix_x1_pattern_kernel<<<1, 32>>>(dIn, dOut);
     CUDA_CHECK(cudaGetLastError());
     
     std::vector<uint32_t> output(32);
