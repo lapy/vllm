@@ -108,7 +108,9 @@ __device__ __forceinline__ void ldmatrix_m8n8_x2_sm70(
 }
 
 // Emulates ldmatrix.sync.aligned.m8n8.x4.shared.b16
-// This is the primary function used by Marlin for loading FragA
+// This is the primary function used by Marlin for loading FragA.
+// A matrix is 16x16 (256 halves). 32 threads. Each thread provides 8 halves (16 bytes).
+// We distribute the data such that each thread holds a vertical slice of 4 columns for 2 rows.
 __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70(
     uint32_t* dst,
     const void* smem_ptr)
@@ -116,85 +118,52 @@ __device__ __forceinline__ void ldmatrix_m8n8_x4_sm70(
     const int lane = threadIdx.x % 32;
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     
-    // smem_ptr points to the start of this thread's row (8 halves = 16 bytes)
     const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(smem_ptr);
-    
-    // Each thread loads its full row (4 uint32_t = 8 halves)
     uint32_t my_words[4];
-    my_words[0] = row_ptr[0];
-    my_words[1] = row_ptr[1];
-    my_words[2] = row_ptr[2];
-    my_words[3] = row_ptr[3];
+    my_words[0] = row_ptr[0]; my_words[1] = row_ptr[1];
+    my_words[2] = row_ptr[2]; my_words[3] = row_ptr[3];
     
-    // The ldmatrix.m8n8.x4 output layout for mma.m16n8k16 operand A:
-    //
-    // For a 16x16 matrix A (row-major, elements are halves):
-    //   The matrix is divided into 8 rows of 16 halves each
-    //   Each thread t (0-31) receives 4 uint32_t covering:
-    //     - dst[0]: 2 halves from row (t%8), columns based on (t/8)
-    //     - dst[1]: 2 halves from row (t%8), next column pair
-    //     - dst[2]: 2 halves from row (t%8)+8, columns based on (t/8)  
-    //     - dst[3]: 2 halves from row (t%8)+8, next column pair
-    //
-    // The key insight: threads 0-7 provide addresses for rows 0-7,
-    // threads 8-15 provide addresses for rows 0-7 again but different columns,
-    // threads 16-23 provide addresses for rows 8-15,
-    // threads 24-31 provide addresses for rows 8-15 again but different columns.
+    // Distribution Protocol:
+    // Src Threads have:
+    // 0-7:   Row 0-7 Left (Cols 0-7)
+    // 8-15:  Row 0-7 Right (Cols 8-15)
+    // 16-23: Row 8-15 Left (Cols 0-7)
+    // 24-31: Row 8-15 Right (Cols 8-15)
     
-    // Within each group of 8 threads:
-    //   - thread's lane%8 gives the row within the 8x8 tile
-    //   - thread's (lane/8)%2 gives which pair of columns (0-1 or 2-3 from each 4-column group)
-    //   - thread's lane/16 gives the 8x8 tile (top or bottom half of 16x16)
+    // We map Dst threads (grp 0..3, row 0..7) to these sources.
+    // Grp 0 (0-7):   Gets Cols 0-3 from Left Srcs.   (Words 0,1)
+    // Grp 1 (8-15):  Gets Cols 8-11 from Right Srcs. (Words 0,1)
+    // Grp 2 (16-23): Gets Cols 4-7 from Left Srcs.   (Words 2,3)
+    // Grp 3 (24-31): Gets Cols 12-15 from Right Srcs. (Words 2,3)
     
-    int row_in_group = lane % 8;  // Which row within the 8-thread group
-    int col_pair = (lane / 8) % 2;  // 0: cols 0-3, 1: cols 4-7 style offset
+    int grp = lane / 8;
+    int row = lane % 8;
     
-    // For m16n8k16 operand A (16 rows, 16 cols):
-    // We need to shuffle to get the right halves to each thread
-    // 
-    // Source thread for row_in_group's data:
-    //   src_lane = row_in_group + (tile_half * 16)
-    // But we also need the row from the other half (rows 8-15 vs 0-7)
+    bool from_right = (grp % 2 == 1); // Grp 1,3
+    bool high_cols  = (grp >= 2);     // Grp 2,3
     
-    // Simplified approach: each thread shuffles from the row provider
-    // Top half (dst[0], dst[1]) comes from rows 0-7
-    // Bottom half (dst[2], dst[3]) comes from rows 8-15
+    int src_top_base = from_right ? 8 : 0;
+    int src_bot_base = from_right ? 24 : 16;
     
-    int src_row_top = row_in_group;  // lanes 0-7 have rows 0-7
-    int src_row_bot = row_in_group + 16;  // lanes 16-23 have rows 8-15
+    int src_top = row + src_top_base;
+    int src_bot = row + src_bot_base;
     
-    // To avoid divergence (where threads process different 'word_base' indices
-    // and thus execute different shuffle instructions), we shuffle ALL words.
-    // This ensures Thread 0 (producing word 0) and Thread 8 (consuming word 2 from Thread 0)
-    // coordinate correctly.
+    // If high_cols (4-7 or 12-15), we need words 2,3 from source.
+    // If low_cols (0-3 or 8-11), we need words 0,1 from source.
+    // Note: Source words: 0,1 cover Cols 0-3 (or 8-11). 2,3 cover Cols 4-7 (or 12-15).
+    int w0_idx = high_cols ? 2 : 0;
+    int w1_idx = high_cols ? 3 : 1;
     
-    uint32_t b0 = __shfl_sync(FULL_MASK, my_words[0], src_row_top);
-    uint32_t b1 = __shfl_sync(FULL_MASK, my_words[1], src_row_top);
-    uint32_t b2 = __shfl_sync(FULL_MASK, my_words[2], src_row_top);
-    uint32_t b3 = __shfl_sync(FULL_MASK, my_words[3], src_row_top);
-
-    // Word selection based on column grouping
-    if (col_pair == 0) {
-        dst[0] = b0;
-        dst[1] = b1;
-    } else {
-        dst[0] = b2;
-        dst[1] = b3;
-    }
+    uint32_t top0 = __shfl_sync(FULL_MASK, my_words[w0_idx], src_top);
+    uint32_t top1 = __shfl_sync(FULL_MASK, my_words[w1_idx], src_top);
     
-    // Repeat for bottom half
-    b0 = __shfl_sync(FULL_MASK, my_words[0], src_row_bot);
-    b1 = __shfl_sync(FULL_MASK, my_words[1], src_row_bot);
-    b2 = __shfl_sync(FULL_MASK, my_words[2], src_row_bot);
-    b3 = __shfl_sync(FULL_MASK, my_words[3], src_row_bot);
+    uint32_t bot0 = __shfl_sync(FULL_MASK, my_words[w0_idx], src_bot);
+    uint32_t bot1 = __shfl_sync(FULL_MASK, my_words[w1_idx], src_bot);
     
-    if (col_pair == 0) {
-        dst[2] = b0;
-        dst[3] = b1;
-    } else {
-        dst[2] = b2;
-        dst[3] = b3;
-    }
+    dst[0] = top0;
+    dst[1] = top1;
+    dst[2] = bot0;
+    dst[3] = bot1;
 }
 
 
@@ -258,32 +227,24 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 
     const half* a_halves = reinterpret_cast<const half*>(A);
 
-    // Write top tile (rows 0-7) K values
-    if (tid < 16) {
-        int row = tid % 8;
-        int k_off = (tid / 8) * 8;
-        sh_a[row * 16 + k_off + 0] = a_halves[0];
-        sh_a[row * 16 + k_off + 1] = a_halves[1];
-        sh_a[row * 16 + k_off + 2] = a_halves[2];
-        sh_a[row * 16 + k_off + 3] = a_halves[3];
-        sh_a[row * 16 + k_off + 4] = a_halves[8];
-        sh_a[row * 16 + k_off + 5] = a_halves[9];
-        sh_a[row * 16 + k_off + 6] = a_halves[10];
-        sh_a[row * 16 + k_off + 7] = a_halves[11];
-    }
-    // Write bottom tile (rows 8-15) K values
-    if (tid >= 16) {
-        int row = 8 + (tid % 8);
-        int k_off = ((tid - 16) / 8) * 8;
-        sh_a[row * 16 + k_off + 0] = a_halves[0];
-        sh_a[row * 16 + k_off + 1] = a_halves[1];
-        sh_a[row * 16 + k_off + 2] = a_halves[2];
-        sh_a[row * 16 + k_off + 3] = a_halves[3];
-        sh_a[row * 16 + k_off + 4] = a_halves[8];
-        sh_a[row * 16 + k_off + 5] = a_halves[9];
-        sh_a[row * 16 + k_off + 6] = a_halves[10];
-        sh_a[row * 16 + k_off + 7] = a_halves[11];
-    }
+    int grp = tid / 8;
+    int row = tid % 8;
+    
+    // Matches ldmatrix_m8n8_x4_sm70 logic
+    // Grp 0: Cols 0-3. Grp 1: Cols 8-11. Grp 2: Cols 4-7. Grp 3: Cols 12-15.
+    int col_start = (grp % 2) * 8 + (grp / 2) * 4;
+
+    // Write Top Tile (Row 0-7)
+    sh_a[row * 16 + col_start + 0] = a_halves[0];
+    sh_a[row * 16 + col_start + 1] = a_halves[1];
+    sh_a[row * 16 + col_start + 2] = a_halves[2];
+    sh_a[row * 16 + col_start + 3] = a_halves[3];
+
+    // Write Bottom Tile (Row 8-15)
+    sh_a[(row + 8) * 16 + col_start + 0] = a_halves[4];
+    sh_a[(row + 8) * 16 + col_start + 1] = a_halves[5];
+    sh_a[(row + 8) * 16 + col_start + 2] = a_halves[6];
+    sh_a[(row + 8) * 16 + col_start + 3] = a_halves[7];
 
     const half* b_halves = reinterpret_cast<const half*>(B);
     int b_col = tid / 4;

@@ -63,6 +63,14 @@ TEMPLATE = (
 
 THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128)]
 
+# SM70-specific configs (Thread K is limited to 16 or 32)
+SM70_THREAD_CONFIGS = [
+    (16, 256, 128),
+    (16, 512, 128),
+    (32, 512, 256),
+    (32, 1024, 256),
+]
+
 THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
 
 QUANT_CONFIGS = [
@@ -187,6 +195,8 @@ def generate_new_kernels():
                 result_dict[(a_type, b_type, c_type)] = []
                 if a_type in ["kFloat16", "kS8"] and c_type == "kFloat16":
                     sm_75_result_dict[(a_type, b_type, c_type)] = []
+                # SM70 only supports specific types (FP16 activation)
+                if a_type == "kFloat16" and c_type == "kFloat16":
                     sm_70_result_dict[(a_type, b_type, c_type)] = []
 
             for group_blocks, m_blocks, thread_configs in itertools.product(
@@ -222,9 +232,30 @@ def generate_new_kernels():
                     config_sm75 = config.copy()
                     config_sm75["stages"] = 2
                     sm_75_result_dict[(a_type, b_type, c_type)].append(config_sm75)
-                if (a_type, b_type, c_type) in sm_70_result_dict and SUPPORT_SM70:
-                    config_sm70 = config.copy()
-                    config_sm70["stages"] = 2
+            
+            # Separate Loop for SM70 kernels using valid configs
+            if (a_type, b_type, c_type) in sm_70_result_dict and SUPPORT_SM70:
+                for group_blocks, m_blocks, thread_configs in itertools.product(
+                    all_group_blocks, all_m_blocks, SM70_THREAD_CONFIGS
+                ):
+                    thread_k, thread_n, threads = thread_configs
+                    if thread_k != 16 and thread_k != 32: continue
+
+                    if m_blocks <= 1 and threads != 128: continue
+                    if m_blocks > 1 and threads != 256: continue
+                    
+                    config_sm70 = {
+                        "threads": threads,
+                        "s_type": s_type,
+                        "thread_m_blocks": max(m_blocks, 1),
+                        # thread_k_blocks dictates k_size: 1->16, 2->32
+                        "thread_k_blocks": thread_k // 16, 
+                        "thread_n_blocks": thread_n // 16,
+                        "m_block_size_8": "true" if m_blocks == 0.5 else "false",
+                        "stages": 2, 
+                        "group_blocks": group_blocks,
+                        "is_zp_float": "false",
+                    }
                     sm_70_result_dict[(a_type, b_type, c_type)].append(config_sm70)
 
     kernel_selector_str = FILE_HEAD_COMMENT
