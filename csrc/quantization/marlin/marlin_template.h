@@ -979,8 +979,9 @@ __global__ void __launch_bounds__(threads) Marlin(
   #pragma unroll
     for (int i = 0; i < b_thread_vecs; i++) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-      // Redundant load for SM70 (Volta) redundancy requirements
-      int th_offset = (threadIdx.x % 16) * b_thread_vecs;
+      // Redundant load for SM70 (Volta) redundancy requirements.
+      // Every 8 threads in a warp handles 8 columns. Redundancy factor 4.
+      int th_offset = (threadIdx.x % 8) * b_thread_vecs;
 #else
       int th_offset = b_sh_rd;
 #endif
@@ -1287,36 +1288,23 @@ __global__ void __launch_bounds__(threads) Marlin(
       dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-      // Populate the extra registers of FragB on SM70 by duplicating the data.
-      // mma_m16n8k16_sm70 expects B data for k=0,1,2,3 in B[0,1,2,3].
-      // frag_b[0,1] populated by dequant contains data for 16 K-rows (via .x and .y).
-      // We will move them to [0,1,2,3] such that each step has its own reg.
-      // (B[0] and B[1] already have k=0,1 data; B[2,3] need k=2,3 data).
-      // Actually, my sm70_mma.h uses B[0], B[1], B[2], B[3].
-      // We'll just redistribute.
-      frag_b0[3] = frag_b0[1];
-      frag_b0[2] = frag_b0[1]; // wait.
-      // Let's just do it explicitly:
-      // frag_b0 was size 2. Now size 4.
-      // dequant filled [0] and [1].
-      // [0].x -> k=0, [0].y -> k=1
-      // [1].x -> k=2, [1].y -> k=3
-      // We'll just copy them to [2] and [3] so they are at least there.
-      frag_b0[3] = frag_b0[1]; 
-      frag_b0[2] = frag_b0[1];
-      // wait, sm70_mma.h uses B[i].x for each step k=i.
-      // So we should move [0].y to [1].x, etc.
-      // Actually, let's just make it simple:
-      frag_b0[3] = __halves2half2(frag_b0[1].y, frag_b0[1].y);
-      frag_b0[2] = __halves2half2(frag_b0[1].x, frag_b0[1].x);
-      frag_b1[3] = __halves2half2(frag_b1[1].y, frag_b1[1].y);
-      frag_b1[2] = __halves2half2(frag_b1[1].x, frag_b1[1].x);
-
-      frag_b0[1] = __halves2half2(frag_b0[0].y, frag_b0[0].y);
-      frag_b0[0] = __halves2half2(frag_b0[0].x, frag_b0[0].x);
-      frag_b1[1] = __halves2half2(frag_b1[0].y, frag_b1[0].y);
-      frag_b1[0] = __halves2half2(frag_b1[0].x, frag_b1[0].x);
+      // Each int4 in frag_b_quant has 4 ints. Each int dequantizes to 2 half2 (4 halves).
+      // Total 4 * 2 = 8 half2 = 16 halves = 16 K-steps.
+      // Matches FragB size 8 and mma_m16n8k16_sm70 requirements.
+      int* b_q_ptr_0 = reinterpret_cast<int*>(&frag_b_quant[k2][0]);
+      int* b_q_ptr_1 = reinterpret_cast<int*>(&frag_b_quant[k2][1]);
+      
+      dequant_data(b_q_ptr_0[0], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 0);
+      dequant_data(b_q_ptr_0[1], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 2);
+      dequant_data(b_q_ptr_0[2], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 4);
+      dequant_data(b_q_ptr_0[3], reinterpret_cast<scalar_32bit_t*>(&frag_b0) + 6);
+      
+      dequant_data(b_q_ptr_1[0], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 0);
+      dequant_data(b_q_ptr_1[1], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 2);
+      dequant_data(b_q_ptr_1[2], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 4);
+      dequant_data(b_q_ptr_1[3], reinterpret_cast<scalar_32bit_t*>(&frag_b1) + 6);
 #endif
+
 
       if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
         sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);

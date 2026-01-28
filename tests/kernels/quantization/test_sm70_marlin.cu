@@ -295,7 +295,7 @@ bool test_mma_random_numerical() {
     uint32_t *d_A, *d_B; 
     float *d_C;
     cudaMalloc(&d_A, A_packed.size()*sizeof(uint32_t));
-    cudaMalloc(&d_B, 32 * 4 * sizeof(uint32_t)); // 32 threads * 4 regs
+    cudaMalloc(&d_B, 32 * 8 * sizeof(uint32_t)); // 32 threads * 8 regs
     cudaMalloc(&d_C, M*N*sizeof(float));
     
     cudaMemcpy(d_A, A_packed.data(), A_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
@@ -596,7 +596,7 @@ bool test_mma_correctness() {
     float *d_C;
     
     int size_A_bytes = 32 * 4 * sizeof(uint32_t); // 32 threads, 4 regs each
-    int size_B_bytes = 32 * 4 * sizeof(uint32_t); // 32 threads, 4 regs each
+    int size_B_bytes = 32 * 8 * sizeof(uint32_t); // 32 threads, 8 regs each
     
     cudaMalloc(&d_A, size_A_bytes);
     cudaMalloc(&d_B, size_B_bytes);
@@ -604,7 +604,7 @@ bool test_mma_correctness() {
     
     // Fill device with patterns
     std::vector<uint32_t> A_packed(32*4);
-    std::vector<uint32_t> B_packed(32*4);
+    std::vector<uint32_t> B_packed(32*8);
     
     // Pack 1.0 into A
     half one = __float2half(1.0f);

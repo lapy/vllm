@@ -215,17 +215,6 @@ __device__ __forceinline__ void mma_m8n8k4_sm70(
 
 
 // Simplified FP16 version (2 output registers)
-__device__ void mma_m8n8k4_sm70_fp16(
-    const half2& a, const half2& b,
-    half2& c0, half2& c1) 
-{
-    uint32_t a_val = *reinterpret_cast<const uint32_t*>(&a);
-    uint32_t b_val = *reinterpret_cast<const uint32_t*>(&b);
-    
-    // SM70 f16 accumulation outputs 2 meaningful uint32_t (4 halves total)
-    // PTX requires 4 output operands but only first 2 contain meaningful data
-    uint32_t d0 = *reinterpret_cast<const uint32_t*>(&c0);
-    uint32_t d1 = *reinterpret_cast<const uint32_t*>(&c1);
 __device__ __forceinline__ void mma_m8n8k4_sm70_fp16(
     uint32_t a0, uint32_t a1, 
     uint32_t b0, uint32_t b1, 
@@ -239,54 +228,67 @@ __device__ __forceinline__ void mma_m8n8k4_sm70_fp16(
 }
 
 // =============================================================================
-// 16x8x16 MMA operations (composed from 4x m8n8k4)
+// Internal helpers for mma_m16n8k16 variants
 // =============================================================================
 
-// Per-thread fragment API: A[4], B[2], frag_c[4]. Matches marlin_mma.h usage.
-// This version works with pre-distributed fragments from Marlin's layout.
-// Accumulates into this thread's FragC via 4 m8n8k4 steps.
-// Per-thread fragment API: A[4], B[2], frag_c[4]. Matches marlin_mma.h usage.
-// This version works with pre-distributed fragments from Marlin's layout.
-// Accumulates into this thread's FragC via 4 m8n8k4 steps.
+__device__ __forceinline__ void mma_m16n8k16_step_float(
+    float* frag_c, bool bottom, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) 
+{
+    const uint32_t FULL_MASK = 0xFFFFFFFF;
+    int tid = threadIdx.x % 32;
+    float c_row[8];
+    int my_row_idx = tid % 8;
+    int my_col_group = tid / 8; // 0, 1, 2, 3
+    int frag_offset = bottom ? 2 : 0;
+    
+    // 1. Gather Initial Accumulators
+    c_row[my_col_group] = frag_c[frag_offset + 0];
+    c_row[my_col_group + 4] = frag_c[frag_offset + 1];
+    
+    // 2. Distribute Row to Redundant Threads
+    for(int i=0; i<4; i++) {
+        c_row[i]   = __shfl_sync(FULL_MASK, c_row[i],   my_row_idx + i*8);
+        c_row[i+4] = __shfl_sync(FULL_MASK, c_row[i+4], my_row_idx + i*8);
+    }
+    
+    // 3. Hardware MMA
+    mma_m8n8k4_sm70(a0, a1, b0, b1, c_row);
+    
+    // 4. Extract Result
+    frag_c[frag_offset + 0] = c_row[my_col_group];
+    frag_c[frag_offset + 1] = c_row[my_col_group + 4];
+}
+
+__device__ __forceinline__ void mma_m16n8k16_step_fp16(
+    uint32_t* frag_c, bool bottom, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) 
+{
+    const uint32_t FULL_MASK = 0xFFFFFFFF;
+    int tid = threadIdx.x % 32;
+    uint32_t c_row[4]; // 8 halves
+    int tid_in_grp = tid % 16;
+    int grp = tid / 16; // 0, 1
+    int frag_offset = bottom ? 2 : 0;
+    
+    c_row[grp * 2 + 0] = frag_c[frag_offset + 0];
+    c_row[grp * 2 + 1] = frag_c[frag_offset + 1];
+    
+    for(int i=0; i<2; i++) {
+        c_row[i*2 + 0] = __shfl_sync(FULL_MASK, c_row[i*2 + 0], tid_in_grp + i*16);
+        c_row[i*2 + 1] = __shfl_sync(FULL_MASK, c_row[i*2 + 1], tid_in_grp + i*16);
+    }
+    
+    mma_m8n8k4_sm70_fp16(a0, a1, b0, b1, c_row);
+    
+    frag_c[frag_offset + 0] = c_row[grp * 2 + 0];
+    frag_c[frag_offset + 1] = c_row[grp * 2 + 1];
+}
+
+// Per-thread fragment API: A[4], B[8], frag_c[4]. Matches marlin_mma.h usage.
+// Note: FragB size increased to 8 to handle Volta redundancy and 16 K-rows.
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
-
-    // m16n8k16 (16x8x16) is emulated via 8 steps of m8n8k4.
-    // FragC Distribution (Marlin standard mapping for 16x8):
-    //   Lane T (0..31):
-    //     FragC[0] = C[T%8, T/8]
-    //     FragC[1] = C[T%8, T/8 + 4]
-    //     FragC[2] = C[T%8 + 8, T/8]
-    //     FragC[3] = C[T%8 + 8, T/8 + 4]
-    // Note: T/8 goes 0..3. This covers columns 0..7 and rows 0..15.
-
-    auto mma_step = [&](bool bottom, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
-        float c_row[8];
-        int my_row_idx = tid % 8;
-        int my_col_group = tid / 8; // 0, 1, 2, 3
-        int frag_offset = bottom ? 2 : 0;
-        
-        // 1. Gather Initial Accumulators
-        c_row[my_col_group] = frag_c[frag_offset + 0];
-        c_row[my_col_group + 4] = frag_c[frag_offset + 1];
-        
-        // 2. Distribute Row to Redundant Threads
-        // Lane 0-7: Row 0-7. Lane 8-15: Row 0-7 again (redundant for mma).
-        // Each lane provides its unique 2 columns, they all end up with same 8.
-        for(int i=0; i<4; i++) {
-            c_row[i]   = __shfl_sync(FULL_MASK, c_row[i],   my_row_idx + i*8);
-            c_row[i+4] = __shfl_sync(FULL_MASK, c_row[i+4], my_row_idx + i*8);
-        }
-        
-        // 3. Hardware MMA
-        mma_m8n8k4_sm70(a0, a1, b0, b1, c_row);
-        
-        // 4. Extract Result
-        frag_c[frag_offset + 0] = c_row[my_col_group];
-        frag_c[frag_offset + 1] = c_row[my_col_group + 4];
-    };
 
     // Prepare A/B Fragments for all steps
     // ldmatrix x4 for m16x16:
@@ -316,8 +318,8 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
         uint32_t rb0 = B[k_idx * 2];
         uint32_t rb1 = B[k_idx * 2 + 1];
 
-        mma_step(false, ra0_t, ra1_t, rb0, rb1);
-        mma_step(true,  ra0_b, ra1_b, rb0, rb1);
+        mma_m16n8k16_step_float(frag_c, false, ra0_t, ra1_t, rb0, rb1);
+        mma_m16n8k16_step_float(frag_c, true,  ra0_b, ra1_b, rb0, rb1);
     }
 }
 
@@ -330,26 +332,8 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 // Per-thread fragment API with transposed B layout
 __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
                                         const uint32_t* B2, float* frag_c) {
-    // Note: This variant is rarely used in the current Marlin SM70 path but 
-    // we fix it for consistency. It takes two transposed B blocks.
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
-
-    auto mma_step = [&](bool bottom, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
-        float c_row[8];
-        int my_row_idx = tid % 8;
-        int my_col_group = tid / 8;
-        int frag_offset = bottom ? 2 : 0;
-        c_row[my_col_group] = frag_c[frag_offset + 0];
-        c_row[my_col_group + 4] = frag_c[frag_offset + 1];
-        for(int i=0; i<4; i++) {
-            c_row[i]   = __shfl_sync(FULL_MASK, c_row[i],   my_row_idx + i*8);
-            c_row[i+4] = __shfl_sync(FULL_MASK, c_row[i+4], my_row_idx + i*8);
-        }
-        mma_m8n8k4_sm70(a0, a1, b0, b1, c_row);
-        frag_c[frag_offset + 0] = c_row[my_col_group];
-        frag_c[frag_offset + 1] = c_row[my_col_group + 4];
-    };
 
     for (int k_idx = 0; k_idx < 4; k_idx++) {
         int a_reg = (k_idx < 2) ? 0 : 1;
@@ -376,8 +360,8 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
             rb1 = rb0;
         }
 
-        mma_step(false, ra0_t, ra1_t, rb0, rb1);
-        mma_step(true,  ra0_b, ra1_b, rb0, rb1);
+        mma_m16n8k16_step_float(frag_c, false, ra0_t, ra1_t, rb0, rb1);
+        mma_m16n8k16_step_float(frag_c, true,  ra0_b, ra1_b, rb0, rb1);
     }
 }
 
@@ -385,36 +369,11 @@ __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
 // FP16 accumulation variants
 // =============================================================================
 
-// Per-thread fragment API: A[4], B[2], frag_c[4] (FragC for fp16 is 4x half2).
+// Per-thread fragment API: A[4], B[8], frag_c[4] (FragC for fp16 is 4x half2).
 __device__ void mma_m16n8k16_sm70_fp16(
     const uint32_t* A, const uint32_t* B, uint32_t* frag_c) {
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     int tid = threadIdx.x % 32;
-
-    auto mma_step = [&](bool bottom, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
-        uint32_t c_row[4]; // 8 halves
-        int my_row_idx = tid % 8;
-        int my_col_group = tid / 16; // 0, 1 (Wait, for f16 each thread owns 4 cols?)
-        // Let's use simple 2-thread redundancy: 0-15 and 16-31.
-        // Each thread owns 4 columns of the 8?
-        // tid 0-15: cols 0,1,2,3. tid 16-31: cols 4,5,6,7?
-        int tid_in_grp = tid % 16;
-        int grp = tid / 16;
-        int frag_offset = bottom ? 2 : 0;
-        
-        c_row[grp * 2 + 0] = frag_c[frag_offset + 0];
-        c_row[grp * 2 + 1] = frag_c[frag_offset + 1];
-        
-        for(int i=0; i<2; i++) {
-            c_row[i*2 + 0] = __shfl_sync(FULL_MASK, c_row[i*2 + 0], tid_in_grp + i*16);
-            c_row[i*2 + 1] = __shfl_sync(FULL_MASK, c_row[i*2 + 1], tid_in_grp + i*16);
-        }
-        
-        mma_m8n8k4_sm70_fp16(a0, a1, b0, b1, c_row);
-        
-        frag_c[frag_offset + 0] = c_row[grp * 2 + 0];
-        frag_c[frag_offset + 1] = c_row[grp * 2 + 1];
-    };
 
     for (int k_idx = 0; k_idx < 4; k_idx++) {
         int a_reg = (k_idx < 2) ? 0 : 1;
@@ -426,8 +385,8 @@ __device__ void mma_m16n8k16_sm70_fp16(
         uint32_t ra1_b = __shfl_sync(FULL_MASK, A[a_reg + 2], tid % 8 + t_off1);
         uint32_t rb0 = B[k_idx * 2];
         uint32_t rb1 = B[k_idx * 2 + 1];
-        mma_step(false, ra0_t, ra1_t, rb0, rb1);
-        mma_step(true,  ra0_b, ra1_b, rb0, rb1);
+        mma_m16n8k16_step_fp16(frag_c, false, ra0_t, ra1_t, rb0, rb1);
+        mma_m16n8k16_step_fp16(frag_c, true,  ra0_b, ra1_b, rb0, rb1);
     }
 }
 
@@ -441,7 +400,7 @@ __device__ void mma_m16n8k16_sm70_fp16(
 __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     mma_m16n8k16_sm70(A, B, frag_c);
-    mma_m16n8k16_sm70(A + 4, B + 4, frag_c);
+    mma_m16n8k16_sm70(A + 4, B + 8, frag_c);
 }
 
 

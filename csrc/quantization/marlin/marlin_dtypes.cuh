@@ -29,7 +29,7 @@ class MarlinScalarType<vllm::kFloat16.id()> {
   // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
   using FragA = Vec<half2, 4>;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  using FragB = Vec<half2, 4>;
+  using FragB = Vec<half2, 8>;
 #else
   using FragB = Vec<half2, 2>;
 #endif
