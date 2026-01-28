@@ -320,24 +320,27 @@ __global__ void marlin_simulation_dequant_kernel(
         uint32_t q = B_quant[tid];
         half2 frag_b_h2[4]; // 8 halves total
         
-        // Dequant 1st set (4 values)
+        // Dequant 1st set (cols 0-3: extracts as [e2,e0] and [e3,e1])
         dequant<half2, vllm::kU4.id(), false>(q, &frag_b_h2[0]);
-        // Dequant 2nd set (next 4 values)
-        dequant<half2, vllm::kU4.id(), false>(q >> 8, &frag_b_h2[2]);
+        // Dequant 2nd set (cols 4-7: extracts as [e6,e4] and [e7,e5])
+        dequant<half2, vllm::kU4.id(), false>(q >> 16, &frag_b_h2[2]);
         
-        // Apply scales
-        uint32_t s_vec = scales[0]; 
-        half2 s_h2 = *reinterpret_cast<half2*>(&s_vec);
+        // Correct per-column scale application
+        // scales[0] = [s1, s0], scales[1] = [s3, s2], etc.
+        half2 s01 = *reinterpret_cast<const half2*>(&scales[0]);
+        half2 s23 = *reinterpret_cast<const half2*>(&scales[1]);
+        half2 s45 = *reinterpret_cast<const half2*>(&scales[2]);
+        half2 s67 = *reinterpret_cast<const half2*>(&scales[3]);
         
-        #pragma unroll
-        for(int i=0; i<4; i++) frag_b_h2[i] = __hmul2(frag_b_h2[i], s_h2);
+        // Layout from dequant is [e2, e0], [e3, e1], [e6, e4], [e7, e5]
+        frag_b_h2[0] = __hmul2(frag_b_h2[0], __halves2half2(s01.x, s23.x)); // e2*s2, e0*s0
+        frag_b_h2[1] = __hmul2(frag_b_h2[1], __halves2half2(s01.y, s23.y)); // e3*s3, e1*s1
+        frag_b_h2[2] = __hmul2(frag_b_h2[2], __halves2half2(s45.x, s67.x)); // e6*s6, e4*s4
+        frag_b_h2[3] = __hmul2(frag_b_h2[3], __halves2half2(s45.y, s67.y)); // e7*s7, e5*s5
         
         // Store dequantized B to shared
-        // Each thread T handles 8 elements -> 4 uint32s
-        sh_b[tid * 4 + 0] = *reinterpret_cast<uint32_t*>(&frag_b_h2[0]);
-        sh_b[tid * 4 + 1] = *reinterpret_cast<uint32_t*>(&frag_b_h2[1]);
-        sh_b[tid * 4 + 2] = *reinterpret_cast<uint32_t*>(&frag_b_h2[2]);
-        sh_b[tid * 4 + 3] = *reinterpret_cast<uint32_t*>(&frag_b_h2[3]);
+        #pragma unroll
+        for(int i=0; i<4; i++) sh_b[tid * 4 + i] = *reinterpret_cast<uint32_t*>(&frag_b_h2[i]);
     }
     
     __syncwarp();
@@ -458,38 +461,41 @@ bool test_marlin_simulation_dequant() {
 
 bool test_marlin_performance() {
     printf("Running test_marlin_performance (Throughput Measurement)...\n");
-    const int M=16, K=16, N=8;
-    const int num_iters = 1000;
-    const int warmup_iters = 100;
+    const int M=16, K=1024, N=128; // Larger workload for better stats
+    const int num_iters = 100;
+    const int warmup_iters = 10;
 
-    std::vector<half> A_ref(M*K, __float2half(1.0f));
-    std::vector<uint32_t> B_quant(16, 0x12345678);
-    std::vector<half> scales_ref(N, __float2half(0.5f));
+    // FLOPs calculation: 2 * M * N * K
+    double flops_per_kernel = 2.0 * M * N * K;
     
-    uint32_t *dA, *dB, *dS; float *dC;
+    // We'll use the looped simulation kernel for benchmarking as it works on larger K
+    std::vector<half> A_ref(M*K, __float2half(1.0f));
+    std::vector<half> B_ref(K*N, __float2half(0.1f));
+    
+    uint32_t *dA, *dB; float *dC;
     cudaMalloc(&dA, M*K*sizeof(half));
-    cudaMalloc(&dB, 16 * sizeof(uint32_t));
-    cudaMalloc(&dS, N * sizeof(half));
-    cudaMalloc(&dC, M*N * sizeof(float));
+    cudaMalloc(&dB, K*N*sizeof(half));
+    cudaMalloc(&dC, M*N*sizeof(float));
     
     cudaMemcpy(dA, A_ref.data(), M*K*sizeof(half), cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, B_quant.data(), 16 * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(dS, scales_ref.data(), N * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_ref.data(), K*N*sizeof(half), cudaMemcpyHostToDevice);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    int K_iters = K / 16;
+
     // Warmup
     for(int i=0; i<warmup_iters; i++) {
-        marlin_simulation_dequant_kernel<<<1, 32>>>(dA, dB, dS, dC);
+        marlin_simulation_looped_kernel<<<100, 32>>>(dA, dB, dC, K_iters);
     }
     cudaDeviceSynchronize();
 
     // Benchmark
     cudaEventRecord(start);
     for(int i=0; i<num_iters; i++) {
-        marlin_simulation_dequant_kernel<<<1, 32>>>(dA, dB, dS, dC);
+        marlin_simulation_looped_kernel<<<100, 32>>>(dA, dB, dC, K_iters);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -499,16 +505,15 @@ bool test_marlin_performance() {
     float seconds = milliseconds / 1000.0f;
     float avg_time_sec = seconds / num_iters;
 
-    // FLOPs calculation: 2 * M * N * K
-    double flops = 2.0 * M * N * K;
-    double tflops = (flops / avg_time_sec) / 1e12;
+    double total_flops = flops_per_kernel * 100.0 * num_iters; // 100 blocks
+    double tflops = (total_flops / seconds) / 1e12;
 
-    printf("  Avg Time: %.3f us\n", (avg_time_sec * 1e6));
-    printf("  Simulated Throughput: %.3f TFLOPS (for 1 Warp on SM70)\n", tflops);
+    printf("  Avg Kernel Time: %.3f ms\n", milliseconds / num_iters);
+    printf("  Simulated Throughput: %.3f TFLOPS (SM70 emulation path)\n", tflops);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    cudaFree(dA); cudaFree(dB); cudaFree(dS); cudaFree(dC);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
 
     return true;
 }
