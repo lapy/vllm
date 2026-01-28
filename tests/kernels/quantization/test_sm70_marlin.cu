@@ -235,8 +235,12 @@ __global__ void marlin_simulation_looped_kernel(
 
         // --- STAGE 2: Shared -> Reg ---
         // A Fragment Distribution (already handled by ldmatrix emulation shuffles)
+        // ldmatrix emulation
         uint32_t frag_a[4];
-        ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
+        // Correct ldmatrix pointer for m8n8.x4 (16x16 block)
+        int a_row_off = (tid % 8) + (tid / 16) * 8;
+        int a_col_off = ((tid / 8) % 2) * 4;
+        ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[a_row_off * 8 + a_col_off]);
         
         // B Fragment Distribution for m8n8k4 building block:
         // Lane T (0..31) provides elements for Column T%8.
@@ -299,12 +303,10 @@ __global__ void marlin_simulation_dequant_kernel(
     if (tid >= 32) return;
 
     // --- STAGE 1: Load A ---
-    // Linear load for now to ensure numerical baseline
+    // Load A: 128 uint32s. 32 threads. Each thread loads 4.
     for (int i = 0; i < 4; i++) {
-        int linear_idx = tid * 4 + i;
-        if (linear_idx < 128) {
-            sh_a[linear_idx] = A_global[linear_idx];
-        }
+        int idx = tid * 4 + i;
+        if (idx < 128) sh_a[idx] = A_global[idx];
     }
     
     // --- STAGE 2: Load B, Dequantize, and Store Linearized ---
@@ -318,35 +320,37 @@ __global__ void marlin_simulation_dequant_kernel(
         dequant<half2, vllm::kU4.id(), false>(q >> 8, &frag_b_h2[2]);
         
         // Correct per-column scale application
-        // S01 = [s1, s0], S23 = [s3, s2], S45 = [s5, s4], S67 = [s7, s6]
-        half2 S01 = *reinterpret_cast<const half2*>(&scales[0]);
-        half2 S23 = *reinterpret_cast<const half2*>(&scales[1]);
-        half2 S45 = *reinterpret_cast<const half2*>(&scales[2]);
-        half2 S67 = *reinterpret_cast<const half2*>(&scales[3]);
+        half2 S01 = *reinterpret_cast<const half2*>(&scales[0]); // [s1, s0]
+        half2 S23 = *reinterpret_cast<const half2*>(&scales[1]); // [s3, s2]
+        half2 S45 = *reinterpret_cast<const half2*>(&scales[2]); // [s5, s4]
+        half2 S67 = *reinterpret_cast<const half2*>(&scales[3]); // [s7, s6]
         
-        // Layout: frag_b_h2[0]=[n4, n0], [1]=[n5, n1], [2]=[n6, n2], [3]=[n7, n3]
-        frag_b_h2[0] = __hmul2(frag_b_h2[0], __halves2half2(S01.x, S45.x)); // n4*s4, n0*s0
-        frag_b_h2[1] = __hmul2(frag_b_h2[1], __halves2half2(S01.y, S45.y)); // n5*s5, n1*s1
-        frag_b_h2[2] = __hmul2(frag_b_h2[2], __halves2half2(S23.x, S67.x)); // n6*s6, n2*s2
-        frag_b_h2[3] = __hmul2(frag_b_h2[3], __halves2half2(S23.y, S67.y)); // n7*s7, n3*s3
+        // [s4, s0], [s5, s1], [s6, s2], [s7, s3]
+        frag_b_h2[0] = __hmul2(frag_b_h2[0], __halves2half2(S45.x, S01.x));
+        frag_b_h2[1] = __hmul2(frag_b_h2[1], __halves2half2(S45.y, S01.y));
+        frag_b_h2[2] = __hmul2(frag_b_h2[2], __halves2half2(S67.x, S23.x));
+        frag_b_h2[3] = __hmul2(frag_b_h2[3], __halves2half2(S67.y, S23.y));
         
-        // Re-linearize to sh_b: sh_b[r*4 + 0] = [n1, n0], [1] = [n3, n2], [2] = [n5, n4], [3] = [n7, n6]
-        half2 res0 = __halves2half2(frag_b_h2[0].x, frag_b_h2[1].x);
-        half2 res1 = __halves2half2(frag_b_h2[2].x, frag_b_h2[3].x);
-        half2 res2 = __halves2half2(frag_b_h2[0].y, frag_b_h2[1].y);
-        half2 res3 = __halves2half2(frag_b_h2[2].y, frag_b_h2[3].y);
+        // Re-linearize to sh_b: [n1, n0], [n3, n2], [n5, n4], [n7, n6]
+        half2 r0 = __halves2half2(frag_b_h2[0].x, frag_b_h2[1].x);
+        half2 r1 = __halves2half2(frag_b_h2[2].x, frag_b_h2[3].x);
+        half2 r2 = __halves2half2(frag_b_h2[0].y, frag_b_h2[1].y);
+        half2 r3 = __halves2half2(frag_b_h2[2].y, frag_b_h2[3].y);
         
-        sh_b[tid * 4 + 0] = *reinterpret_cast<uint32_t*>(&res0);
-        sh_b[tid * 4 + 1] = *reinterpret_cast<uint32_t*>(&res1);
-        sh_b[tid * 4 + 2] = *reinterpret_cast<uint32_t*>(&res2);
-        sh_b[tid * 4 + 3] = *reinterpret_cast<uint32_t*>(&res3);
+        sh_b[tid * 4 + 0] = *reinterpret_cast<uint32_t*>(&r0);
+        sh_b[tid * 4 + 1] = *reinterpret_cast<uint32_t*>(&r1);
+        sh_b[tid * 4 + 2] = *reinterpret_cast<uint32_t*>(&r2);
+        sh_b[tid * 4 + 3] = *reinterpret_cast<uint32_t*>(&r3);
     }
     
-    __syncwarp();
+    __syncthreads();
 
     // --- STAGE 3: Compute with Swizzled A ---
     uint32_t frag_a[4];
-    ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
+    // Correct ldmatrix pointer for m8n8.x4 (16x16 block)
+    int a_row_off = (tid % 8) + (tid / 16) * 8;
+    int a_col_off = ((tid / 8) % 2) * 4;
+    ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[a_row_off * 8 + a_col_off]);
     
     // FragB size 8 is REQUIRED for SM70 mma_m16n8k16
     uint32_t frag_b[8];
