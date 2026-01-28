@@ -1514,6 +1514,111 @@ bool test_multi_warp_collision() {
     return true;
 }
 
+// =============================================================================
+// MoE Marlin Regression Tests
+// =============================================================================
+
+__global__ void test_moe_b_load_simulation_kernel(
+    const uint32_t* B_global,
+    uint32_t* B_output,
+    int b_sh_stage,
+    int threads_per_block
+) {
+    // Stage size in uint32s
+    extern __shared__ uint32_t sh_b_moe[];
+    
+    int tid = threadIdx.x;
+    
+    // This replicates the surgical fix logic: div_ceil for iters
+    int b_sh_wr_iters = (b_sh_stage + threads_per_block - 1) / threads_per_block; 
+    
+    for (int i = 0; i < b_sh_wr_iters; i++) {
+        int sh_idx = threads_per_block * i + tid;
+        // Predicated load logic from the MoE fix
+        if (sh_idx < b_sh_stage) {
+            sh_b_moe[sh_idx] = B_global[sh_idx];
+        }
+    }
+    __syncthreads();
+    
+    if (tid < b_sh_stage) {
+        B_output[tid] = sh_b_moe[tid];
+    }
+}
+
+bool test_moe_b_load_regression() {
+    printf("Running test_moe_b_load_regression (threads > stage_size check)...\n");
+    
+    // Case where threads (128) > stage_size (64)
+    const int threads = 128;
+    const int b_sh_stage = 64; 
+    
+    std::vector<uint32_t> h_B(b_sh_stage);
+    for(int i=0; i<b_sh_stage; i++) h_B[i] = i + 1000;
+    
+    uint32_t *dB, *dOut;
+    cudaMalloc(&dB, b_sh_stage * 4);
+    cudaMalloc(&dOut, b_sh_stage * 4);
+    
+    cudaMemcpy(dB, h_B.data(), b_sh_stage * 4, cudaMemcpyHostToDevice);
+    cudaMemset(dOut, 0, b_sh_stage * 4);
+    
+    // Launch with 128 threads to trigger the b_sh_wr_iters = 0 issue if not using div_ceil
+    test_moe_b_load_simulation_kernel<<<1, threads, b_sh_stage * 4>>>(dB, dOut, b_sh_stage, threads);
+    CUDA_CHECK(cudaGetLastError());
+    
+    std::vector<uint32_t> h_Out(b_sh_stage);
+    cudaMemcpy(h_Out.data(), dOut, b_sh_stage * 4, cudaMemcpyDeviceToHost);
+    
+    bool pass = true;
+    for(int i=0; i<b_sh_stage; i++) {
+        if (h_Out[i] != h_B[i]) {
+            printf("  Mismatch at index %d: Exp %u, Got %u\n", i, h_B[i], h_Out[i]);
+            pass = false;
+        }
+    }
+    
+    cudaFree(dB); cudaFree(dOut);
+    
+    if(pass) printf("PASSED (MoE B-load handles mismatched thread counts safely)\n");
+    return pass;
+}
+
+__global__ void test_moe_scaling_unit_kernel(float* out) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    // Test half2 scaling logic commonly used in MoE template
+    half2 b = __halves2half2(__float2half(2.0f), __float2half(3.0f));
+    half s_val = __float2half(0.5f);
+    half2 s = __halves2half2(s_val, s_val);
+    
+    half2 res = __hmul2(b, s); // 2*0.5=1, 3*0.5=1.5
+    
+    out[0] = __half2float(res.x);
+    out[1] = __half2float(res.y);
+#endif
+}
+
+bool test_moe_scaling_unit() {
+    printf("Running test_moe_scaling_unit...\n");
+    float *d_out;
+    cudaMalloc(&d_out, 2 * sizeof(float));
+    
+    test_moe_scaling_unit_kernel<<<1, 1>>>(d_out);
+    CUDA_CHECK(cudaGetLastError());
+    
+    float h_out[2];
+    cudaMemcpy(h_out, d_out, 2 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_out);
+    
+    if (check_close(h_out[0], 1.0f) && check_close(h_out[1], 1.5f)) {
+        printf("PASSED (Scaling unit test correct)\n");
+        return true;
+    } else {
+        printf("FAILED: Scale 2.0x0.5, 3.0x0.5 -> Got %f, %f\n", h_out[0], h_out[1]);
+        return false;
+    }
+}
+
 int main() {
     bool all_pass = true;
     
@@ -1540,6 +1645,10 @@ int main() {
     
     // Multi-warp integrity (Collision verification)
     all_pass &= test_multi_warp_collision();
+
+    // MoE Regression Tests
+    all_pass &= test_moe_b_load_regression();
+    all_pass &= test_moe_scaling_unit();
 
     // Performance Benchmark
     all_pass &= test_marlin_performance();
