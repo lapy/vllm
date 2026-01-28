@@ -1309,7 +1309,9 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
+        intermediate_size_full = extra_weight_attrs.pop(
+            "intermediate_size_full", intermediate_size_per_partition
+        )
         w13_num_shards = 2 if self.moe.is_act_and_mul else 1
 
         # Will transpose the loaded weight along the

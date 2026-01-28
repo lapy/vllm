@@ -521,6 +521,17 @@ class FusedMoE(CustomOp):
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
+        
+        # Warn if using apply_router_weight_on_input with quantized MoE
+        if (
+            apply_router_weight_on_input
+            and quant_config is not None
+            and quant_config.quant_method == "marlin-moe"
+        ):
+            logger.warning(
+                "apply_router_weight_on_input is not supported with Marlin MoE "
+                "quantization. The model may fall back to slower kernels."
+            )
 
         self.capture: Callable[[torch.Tensor], None] | None = None
         if (
@@ -626,14 +637,8 @@ class FusedMoE(CustomOp):
             "params_dtype": params_dtype,
             "weight_loader": self.weight_loader,
             "global_num_experts": self.global_num_experts,
+            "intermediate_size_full": intermediate_size,
         }
-        # need full intermediate size pre-sharding for WNA16 act order
-        if self.quant_method.__class__.__name__ in (
-            "GPTQMarlinMoEMethod",
-            "CompressedTensorsWNA16MarlinMoEMethod",
-            "CompressedTensorsWNA16MoEMethod",
-        ):
-            moe_quant_params["intermediate_size_full"] = intermediate_size
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 

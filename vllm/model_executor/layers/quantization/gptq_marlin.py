@@ -519,7 +519,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 "W8A8-INT8 is not supported by marlin kernel."
             )
 
-        intermediate_size_full = extra_weight_attrs.pop("intermediate_size_full")
+        intermediate_size_full = extra_weight_attrs.pop(
+            "intermediate_size_full", intermediate_size_per_partition
+        )
 
         self.is_k_full = (not self.quant_config.desc_act) or (
             intermediate_size_per_partition == intermediate_size_full

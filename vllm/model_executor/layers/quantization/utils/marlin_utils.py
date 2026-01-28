@@ -231,6 +231,9 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
 
 def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
     if current_platform.is_rocm():
+        logger.debug(
+            "MoE Marlin not supported on ROCm, falling back to alternative kernel"
+        )
         return False
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
@@ -245,6 +248,26 @@ def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
         and intermediate_size_per_partition % max(64, group_size) == 0
     )
     supports_group_size = group_size in [-1, 32, 64, 128]
+    
+    if not supports_shape:
+        logger.debug(
+            f"MoE Marlin shape check failed: hidden_size={hidden_size} "
+            f"(must be % 128 == 0), intermediate_size_per_partition="
+            f"{intermediate_size_per_partition} (must be % {max(64, group_size)} == 0)"
+        )
+    
+    if not supports_group_size:
+        logger.debug(
+            f"MoE Marlin group_size={group_size} not supported. "
+            f"Supported values: [-1, 32, 64, 128]"
+        )
+    
+    if not supports_router_weight:
+        logger.debug(
+            "MoE Marlin does not support apply_router_weight_on_input=True, "
+            "falling back to alternative kernel"
+        )
+    
     return supports_shape and supports_group_size and supports_router_weight
 
 
