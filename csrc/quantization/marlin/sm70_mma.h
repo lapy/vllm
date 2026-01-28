@@ -267,8 +267,8 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 
     // k=0: Process first k-slice (k dimension elements 0-3)
     {
-        half2 a = *reinterpret_cast`<const half2*>`(&A[0]);
-        half2 b = *reinterpret_cast`<const half2*>`(&B[0]);
+        half2 a = *reinterpret_cast<const half2*>(&A[0]);
+        half2 b = *reinterpret_cast<const half2*>(&B[0]);
         half2 a_top = __halves2half2(a.x, a.x);
         half2 a_bot = __les2half2(a.y, a.y);
         half2 b_use = __halves2half2(b.x, b.x);
@@ -278,8 +278,8 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 
     // k=1
     {
-        half2 a = *reinterpret_cast`<const half2*>`(&A[1]);
-        half2 b = *reinterpret_cast`<const half2*>`(&B[1]);
+        half2 a = *reinterpret_cast<const half2*>(&A[1]);
+        half2 b = *reinterpret_cast<const half2*>(&B[1]);
         half2 a_top = __halves2half2(a.x, a.x);
         half2 a_bot = __halves2half2(a.y, a.y);
         half2 b_use = __halves2half2(b.y, b.y);
@@ -289,8 +289,8 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 
     // k=2
     {
-        half2 a = *reinterpret_cast`<const half2*>`(&A[2]);
-        half2 b = *reinterpret_cast`<const half2*>`(&B[2]);
+        half2 a = *reinterpret_cast<const half2*>(&A[2]);
+        half2 b = *reinterpret_cast<const half2*>(&B[2]);
         half2 a_top = __halves2half2(a.x, a.x);
         half2 a_bot = __halves2half2(a.y, a.y);
         half2 b_use = __halves2half2(b.x, b.x);
@@ -300,8 +300,8 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 
     // k=3
     {
-        half2 a = *reinterpret_cast`<const half2*>`(&A[3]);
-        half2 b = *reinterpret_cast`<const half2*>`(&B[3]);
+        half2 a = *reinterpret_cast<const half2*>(&A[3]);
+        half2 b = *reinterpret_cast<const half2*>(&B[3]);
         half2 a_top = __halves2half2(a.x, a.x);
         half2 a_bot = __halves2half2(a.y, a.y);
         half2 b_use = __halves2half2(b.y, b.y);
