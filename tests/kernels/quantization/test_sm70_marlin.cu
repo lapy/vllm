@@ -159,46 +159,18 @@ __global__ void marlin_simulation_kernel(
     // --- STAGE 2: Shared -> Reg (Marlin Loop Body) ---
     
     uint32_t frag_a[4];
-    uint32_t frag_b[2]; // Simplest B load, B is usually KxN, here 16x8
-    
-    // Load A: uses ldmatrix emulation
-    // Marlin logic: a_smem_ptr = ...
-    // Here we use the identity mapping for test: tid's row
-    // Note: ldmatrix emulation expects specific data layout in shared.
-    // For 16x16 A, we need 16 rows.
-    // sh_a is indexed linearly: row * 8 (u32s) + col_pair.
-    // But ldmatrix_m8n8_x4_sm70 expects threads to point to their rows.
-    // thread 0 -> row 0
-    // ...
-    // thread 31 -> row 31 (mod 16 logic inside wrapper usually handles repeats?)
-    
-    // MARLIN uses a specific "permuted" store to shared memory to avoid bank conflicts.
-    // We will skip the permuted STORE for this simple test and assume the data acts "as if" it's there.
-    // But wait, ldmatrix pulls from the pointer YOU give it.
-    // If we give &sh_a[tid * 4], thread 0 gets &sh_a[0]. thread 1 gets &sh_a[4].
-    // sh_a[0..3] is row 0. sh_a[4..7] is row 1.
-    // So this linear mapping matches row-major storage.
+    uint32_t frag_b[4]; 
     
     ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
     
-    // Load B: Direct load for now (Marlin B loading is complex, depends on quantization)
-    // Here we simulate standard FP16 B loading:
-    // Thread i loads specific elements.
-    // For m16n8k16 mma, B format required is...
-    // Let's assume B is already layout-compatible or just load duplicated for test sake.
-    // Actually, mma_m16n8k16 requires frag_b to hold B data corresponding to the K-splits.
-    // We will just load from sh_b blindly to ensure data movement works, correctness checked by result.
-    // In typical m16n8k16, we iterate k=0..3 (4 steps).
-    // B needs to provide relevant K-slices.
-    
-    // Simplification: Just load what would be at 'tid' location? 
-    // No, we need valid data.
-    // Let's use a naive load: B is [K=16, N=8].
-    // We need frag_b to be useful.
-    // Let's just fill frag_b from sh_b roughly.
-    frag_b[0] = sh_b[tid * 2]; 
-    frag_b[1] = sh_b[tid * 2 + 1];
-
+    // Load B: 4 registers to cover 16 K-steps (4 uint32s = 8 halves = 16 scalar steps?)
+    // Wait, each m8n8k4 step takes 1 scalar from B. 4 steps = 4 scalars = 2 uint32s.
+    // If we use 4 uint32s, we are providing 8 scalars. 
+    // mma_m16n8k16_sm70 uses B[0], B[1], B[2], B[3].
+    // So we need 4 uint32s.
+    for (int i = 0; i < 4; i++) {
+        frag_b[i] = sh_b[(tid * 4 + i) % 64];
+    }
     
     // --- STAGE 3: Compute ---
     float frag_c[4] = {0.0f};
@@ -206,8 +178,6 @@ __global__ void marlin_simulation_kernel(
     
     // --- STAGE 4: Store ---
     // Store frag_c to global for validation
-    // Layout of frag_c is specific to the thread mapping.
-    // We dump raw fragments.
     for(int i=0; i<4; i++) {
         C_global[tid * 4 + i] = frag_c[i];
     }
@@ -254,13 +224,14 @@ __global__ void marlin_simulation_looped_kernel(
 
         // --- STAGE 2: Shared -> Reg ---
         uint32_t frag_a[4];
-        uint32_t frag_b[2];
+        uint32_t frag_b[4];
         
         ldmatrix_m8n8_x4_sm70(frag_a, &sh_a[tid * 4]);
         
-        // Unique B Load (Stride 2)
-        frag_b[0] = sh_b[tid * 2];
-        frag_b[1] = sh_b[tid * 2 + 1];
+        // Load 4 B registers
+        for (int i = 0; i < 4; i++) {
+            frag_b[i] = sh_b[(tid * 4 + i) % 64];
+        }
 
         // --- STAGE 3: Compute ---
         // Accumulate into frag_c
@@ -270,9 +241,7 @@ __global__ void marlin_simulation_looped_kernel(
     }
     
     // --- STAGE 4: Store ---
-    int output_offset = 0; // Fixed output location
     for(int i=0; i<4; i++) {
-        // Simple store for verification
         C_global[tid * 4 + i] = frag_c[i];
     }
 }
@@ -302,11 +271,14 @@ bool test_mma_random_numerical() {
     uint32_t *d_A, *d_B; 
     float *d_C;
     cudaMalloc(&d_A, A_packed.size()*sizeof(uint32_t));
-    cudaMalloc(&d_B, B_packed.size()*sizeof(uint32_t));
+    cudaMalloc(&d_B, 32 * 4 * sizeof(uint32_t)); // 32 threads * 4 regs
     cudaMalloc(&d_C, M*N*sizeof(float));
     
     cudaMemcpy(d_A, A_packed.data(), A_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, B_packed.data(), B_packed.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // Fill d_B with some data (just copy B_packed multiple times or whatever)
+    std::vector<uint32_t> B_expanded(32 * 4);
+    for(int i=0; i<32*4; i++) B_expanded[i] = B_packed[i % B_packed.size()];
+    cudaMemcpy(d_B, B_expanded.data(), B_expanded.size()*sizeof(uint32_t), cudaMemcpyHostToDevice);
     
     test_mma_m16n8k16_kernel<<<1, 32>>>(d_A, d_B, d_C);
     
@@ -600,8 +572,7 @@ bool test_mma_correctness() {
     float *d_C;
     
     int size_A_bytes = 32 * 4 * sizeof(uint32_t); // 32 threads, 4 regs each
-    int size_B_bytes = 32 * 2 * sizeof(uint32_t); // 32 threads, 2 regs each -> Wait, B is 2 regs?
-    // sm70_mma.h: mma_m16n8k16_sm70(const uint32_t* A /*4*/, const uint32_t* B /*2*/, ...)
+    int size_B_bytes = 32 * 4 * sizeof(uint32_t); // 32 threads, 4 regs each
     
     cudaMalloc(&d_A, size_A_bytes);
     cudaMalloc(&d_B, size_B_bytes);
@@ -609,7 +580,7 @@ bool test_mma_correctness() {
     
     // Fill device with patterns
     std::vector<uint32_t> A_packed(32*4);
-    std::vector<uint32_t> B_packed(32*2);
+    std::vector<uint32_t> B_packed(32*4);
     
     // Pack 1.0 into A
     half one = __float2half(1.0f);

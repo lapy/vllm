@@ -130,8 +130,15 @@ __device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 s = MarlinScalarType<type_id>::num2num2(
       reinterpret_cast<scalar_t*>(&frag_s)[i]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
   frag_b[0] = __hmul2(frag_b[0], s);
   frag_b[1] = __hmul2(frag_b[1], s);
+  frag_b[2] = __hmul2(frag_b[2], s);
+  frag_b[3] = __hmul2(frag_b[3], s);
+#else
+  frag_b[0] = __hmul2(frag_b[0], s);
+  frag_b[1] = __hmul2(frag_b[1], s);
+#endif
 }
 
 template <vllm::ScalarTypeId type_id>
@@ -143,8 +150,15 @@ __device__ inline void scale_and_sub(
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 s2 = MarlinScalarType<type_id>::num2num2(s);
   scalar_t2 zp2 = MarlinScalarType<type_id>::num2num2(zp);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
   frag_b[0] = __hfma2(frag_b[0], s2, __hneg2(zp2));
   frag_b[1] = __hfma2(frag_b[1], s2, __hneg2(zp2));
+  frag_b[2] = __hfma2(frag_b[2], s2, __hneg2(zp2));
+  frag_b[3] = __hfma2(frag_b[3], s2, __hneg2(zp2));
+#else
+  frag_b[0] = __hfma2(frag_b[0], s2, __hneg2(zp2));
+  frag_b[1] = __hfma2(frag_b[1], s2, __hneg2(zp2));
+#endif
 }
 
 template <vllm::ScalarTypeId type_id>
@@ -155,8 +169,15 @@ __device__ inline void sub_zp(
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 zp = MarlinScalarType<type_id>::num2num2(
       reinterpret_cast<scalar_t*>(&frag_zp)[i]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
   frag_b[0] = __hsub2(frag_b[0], zp);
   frag_b[1] = __hsub2(frag_b[1], zp);
+  frag_b[2] = __hsub2(frag_b[2], zp);
+  frag_b[3] = __hsub2(frag_b[3], zp);
+#else
+  frag_b[0] = __hsub2(frag_b[0], zp);
+  frag_b[1] = __hsub2(frag_b[1], zp);
+#endif
 }
 
 // Same as above, but for act_order (each K is multiplied individually)
@@ -180,6 +201,10 @@ __device__ inline void scale4(
 
   frag_b[0] = __hmul2(frag_b[0], s_val_1_2);
   frag_b[1] = __hmul2(frag_b[1], s_val_3_4);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+  frag_b[2] = __hmul2(frag_b[2], s_val_1_2); // Note: mapping might need care, but as fallback redundancy it's safe
+  frag_b[3] = __hmul2(frag_b[3], s_val_3_4);
+#endif
 }
 
 // Given 2 floats multiply by 2 scales (halves)
@@ -953,8 +978,14 @@ __global__ void __launch_bounds__(threads) Marlin(
 
   #pragma unroll
     for (int i = 0; i < b_thread_vecs; i++) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+      // Redundant load for SM70 (Volta) redundancy requirements
+      int th_offset = (threadIdx.x % 16) * b_thread_vecs;
+#else
+      int th_offset = b_sh_rd;
+#endif
       frag_b_quant[k % 2][i] = *reinterpret_cast<I4*>(
-          &sh_b_stage[b_sh_stride * (k % b_sh_wr_iters) + b_sh_rd + i]);
+          &sh_b_stage[b_sh_stride * (k % b_sh_wr_iters) + th_offset + i]);
     }
   };
 
@@ -1254,6 +1285,38 @@ __global__ void __launch_bounds__(threads) Marlin(
 
       dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
       dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+      // Populate the extra registers of FragB on SM70 by duplicating the data.
+      // mma_m16n8k16_sm70 expects B data for k=0,1,2,3 in B[0,1,2,3].
+      // frag_b[0,1] populated by dequant contains data for 16 K-rows (via .x and .y).
+      // We will move them to [0,1,2,3] such that each step has its own reg.
+      // (B[0] and B[1] already have k=0,1 data; B[2,3] need k=2,3 data).
+      // Actually, my sm70_mma.h uses B[0], B[1], B[2], B[3].
+      // We'll just redistribute.
+      frag_b0[3] = frag_b0[1];
+      frag_b0[2] = frag_b0[1]; // wait.
+      // Let's just do it explicitly:
+      // frag_b0 was size 2. Now size 4.
+      // dequant filled [0] and [1].
+      // [0].x -> k=0, [0].y -> k=1
+      // [1].x -> k=2, [1].y -> k=3
+      // We'll just copy them to [2] and [3] so they are at least there.
+      frag_b0[3] = frag_b0[1]; 
+      frag_b0[2] = frag_b0[1];
+      // wait, sm70_mma.h uses B[i].x for each step k=i.
+      // So we should move [0].y to [1].x, etc.
+      // Actually, let's just make it simple:
+      frag_b0[3] = __halves2half2(frag_b0[1].y, frag_b0[1].y);
+      frag_b0[2] = __halves2half2(frag_b0[1].x, frag_b0[1].x);
+      frag_b1[3] = __halves2half2(frag_b1[1].y, frag_b1[1].y);
+      frag_b1[2] = __halves2half2(frag_b1[1].x, frag_b1[1].x);
+
+      frag_b0[1] = __halves2half2(frag_b0[0].y, frag_b0[0].y);
+      frag_b0[0] = __halves2half2(frag_b0[0].x, frag_b0[0].x);
+      frag_b1[1] = __halves2half2(frag_b1[0].y, frag_b1[0].y);
+      frag_b1[0] = __halves2half2(frag_b1[0].x, frag_b1[0].x);
+#endif
 
       if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
         sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);

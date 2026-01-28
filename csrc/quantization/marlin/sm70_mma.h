@@ -275,56 +275,44 @@ __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
 
     // k=0: Process first k-slice
     {
-        half2 a_t = A_h[0]; // Top K0, K1
-        half2 a_b = A_h[2]; // Bot K0, K1
+        half2 a_t = A_h[0]; half2 a_b = A_h[2];
         half2 b_pair = B_h[0];
-
         half2 a_top = __halves2half2(a_t.x, a_t.x); 
         half2 a_bot = __halves2half2(a_b.x, a_b.x);
         half2 b_use = __halves2half2(b_pair.x, b_pair.x);
-        
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
 
     // k=1
     {
-        half2 a_t = A_h[0];
-        half2 a_b = A_h[2];
-        half2 b_pair = B_h[0];
-
+        half2 a_t = A_h[0]; half2 a_b = A_h[2];
+        half2 b_pair = B_h[1]; 
         half2 a_top = __halves2half2(a_t.y, a_t.y);
         half2 a_bot = __halves2half2(a_b.y, a_b.y);
-        half2 b_use = __halves2half2(b_pair.y, b_pair.y);
-        
+        half2 b_use = __halves2half2(b_pair.x, b_pair.x);
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
 
     // k=2
     {
-        half2 a_t = A_h[1]; // Top K2, K3
-        half2 a_b = A_h[3]; // Bot K2, K3
-        half2 b_pair = B_h[1];
-
+        half2 a_t = A_h[1]; half2 a_b = A_h[3];
+        half2 b_pair = B_h[2];
         half2 a_top = __halves2half2(a_t.x, a_t.x);
         half2 a_bot = __halves2half2(a_b.x, a_b.x);
         half2 b_use = __halves2half2(b_pair.x, b_pair.x);
-        
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
 
     // k=3
     {
-        half2 a_t = A_h[1];
-        half2 a_b = A_h[3];
-        half2 b_pair = B_h[1];
-
+        half2 a_t = A_h[1]; half2 a_b = A_h[3];
+        half2 b_pair = B_h[3];
         half2 a_top = __halves2half2(a_t.y, a_t.y);
         half2 a_bot = __halves2half2(a_b.y, a_b.y);
-        half2 b_use = __halves2half2(b_pair.y, b_pair.y);
-        
+        half2 b_use = __halves2half2(b_pair.x, b_pair.x);
         mma_m8n8k4_sm70(a_top, b_use, c[0], c[1], dummy[0], dummy[1]);
         mma_m8n8k4_sm70(a_bot, b_use, c[2], c[3], dummy[0], dummy[1]);
     }
@@ -453,8 +441,10 @@ __device__ void mma_m16n8k16_sm70_fp16(
              }
         }
         
-        half2 b_pair = B_h[k / 2];
-        half b_scalar = (k % 2 == 0) ? b_pair.x : b_pair.y;
+        // Update to use distinct B fragments B[0]..B[3]
+        half2 b_pair = B_h[k]; 
+        // Use first half of B[k]
+        half b_scalar = b_pair.x;
         half2 b_use = __halves2half2(b_scalar, b_scalar);
         
         // mma_fp16 outputs c0, c1
@@ -478,7 +468,7 @@ __device__ void mma_m16n8k16_sm70_fp16(
 __device__ void mma_m16n8k32_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     mma_m16n8k16_sm70(A, B, frag_c);
-    mma_m16n8k16_sm70(A + 4, B + 2, frag_c);
+    mma_m16n8k16_sm70(A + 4, B + 4, frag_c);
 }
 
 
