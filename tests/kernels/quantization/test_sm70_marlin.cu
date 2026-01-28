@@ -452,6 +452,67 @@ bool test_marlin_simulation_dequant() {
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Performance Benchmarking
+// -----------------------------------------------------------------------------
+
+bool test_marlin_performance() {
+    printf("Running test_marlin_performance (Throughput Measurement)...\n");
+    const int M=16, K=16, N=8;
+    const int num_iters = 1000;
+    const int warmup_iters = 100;
+
+    std::vector<half> A_ref(M*K, __float2half(1.0f));
+    std::vector<uint32_t> B_quant(16, 0x12345678);
+    std::vector<half> scales_ref(N, __float2half(0.5f));
+    
+    uint32_t *dA, *dB, *dS; float *dC;
+    cudaMalloc(&dA, M*K*sizeof(half));
+    cudaMalloc(&dB, 16 * sizeof(uint32_t));
+    cudaMalloc(&dS, N * sizeof(half));
+    cudaMalloc(&dC, M*N * sizeof(float));
+    
+    cudaMemcpy(dA, A_ref.data(), M*K*sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B_quant.data(), 16 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dS, scales_ref.data(), N * sizeof(half), cudaMemcpyHostToDevice);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Warmup
+    for(int i=0; i<warmup_iters; i++) {
+        marlin_simulation_dequant_kernel<<<1, 32>>>(dA, dB, dS, dC);
+    }
+    cudaDeviceSynchronize();
+
+    // Benchmark
+    cudaEventRecord(start);
+    for(int i=0; i<num_iters; i++) {
+        marlin_simulation_dequant_kernel<<<1, 32>>>(dA, dB, dS, dC);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    float seconds = milliseconds / 1000.0f;
+    float avg_time_sec = seconds / num_iters;
+
+    // FLOPs calculation: 2 * M * N * K
+    double flops = 2.0 * M * N * K;
+    double tflops = (flops / avg_time_sec) / 1e12;
+
+    printf("  Avg Time: %.3f us\n", (avg_time_sec * 1e6));
+    printf("  Simulated Throughput: %.3f TFLOPS (for 1 Warp on SM70)\n", tflops);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaFree(dA); cudaFree(dB); cudaFree(dS); cudaFree(dC);
+
+    return true;
+}
+
 bool test_mma_random_numerical() {
     printf("Running test_mma_random_numerical...\n");
     const int M=16, N=8, K=16;
@@ -1138,6 +1199,9 @@ int main() {
     
     // Dequant and Swizzle checks
     all_pass &= test_marlin_simulation_dequant();
+    
+    // Performance Benchmark
+    all_pass &= test_marlin_performance();
 
     if (all_pass) {
         printf("\nALL TESTS PASSED\n");
