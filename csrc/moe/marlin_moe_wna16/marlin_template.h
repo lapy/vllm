@@ -699,11 +699,7 @@ __global__ void Marlin(
   constexpr int b_sh_wr_delta = threads * b_thread_vecs;
   constexpr int b_sh_stage =
       b_sh_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
   constexpr int b_sh_wr_iters = div_ceil(b_sh_stage, b_sh_wr_delta);
-#else
-  constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
-#endif
 
   // Scale sizes/strides without act_order
   int s_gl_stride = prob_n / (b_type == vllm::kFE2M1f ? 16 : 8);
@@ -759,7 +755,7 @@ __global__ void Marlin(
 
   b_gl_rd += B_expert_off + b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
-  auto b_sh_rd = threadIdx.x * b_thread_vecs;
+  int b_sh_rd = (int)threadIdx.x * b_thread_vecs;
   b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
 
   // For act_order
@@ -1002,12 +998,8 @@ __global__ void Marlin(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
         cp_async4_pred(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx],
-                       (threads * i + threadIdx.x) < b_sh_stage);
-#else
-        cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
-#endif
+                       (threads * i + (int)threadIdx.x) < b_sh_stage);
       }
 
       b_gl_rd += b_gl_rd_delta_o;
