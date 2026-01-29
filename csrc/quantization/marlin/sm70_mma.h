@@ -239,180 +239,165 @@ __device__ __forceinline__ uint32_t pack_halves(half h0, half h1) {
 __device__ void mma_m16n8k16_sm70(const uint32_t* A, const uint32_t* B,
                                   float* frag_c) {
     const int lane = threadIdx.x % 32;
-    const uint32_t FULL_MASK = 0xFFFFFFFF;
     
-    // Initialize local accumulators
-    float c_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // ==========================================================================
+    // SM70 m8n8k4 based implementation following CUTLASS documentation exactly:
+    // https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/0t_mma_atom.html
+    //
+    // SM70_QuadPair: Layout<Shape<_4,_2>, Stride<_1,_16>>
+    //   Maps logical thread id [0,8) to warp lane [0,4)U[16,20)
+    //
+    // SM70_8x4_Row: Layout<Shape<_8,_4>, Stride<_1,_8>>
+    //   Thread t holds row t of the 8x4 A/B tile
+    //
+    // SM70_8x8_32b: Layout<Shape<Shape<_2,_2,_2>, Shape<_2,_2,_2>>,
+    //                      Stride<Stride<_1,_16,_4>, Stride<_8,_2,_32>>>
+    //   Maps (thread_id, value_id) to (m,n) coordinate in 8x8 C matrix
+    // ==========================================================================
     
-    // m16n8k16 = 4 iterations of k (each k=4) × 2 row blocks (m=8 each)
-    // We need to carefully map the fragment data to m8n8k4 inputs
+    // Shared memory for the full matrices
+    __shared__ __align__(16) half sh_A[16 * 16];
+    __shared__ __align__(16) half sh_B[16 * 8];
+    __shared__ __align__(16) float sh_C[16 * 8];
     
-    // A fragment layout for m16n8k16:
-    //   A[0]: k=0..1 for row_group (rows 0-7 depending on lane)
-    //   A[1]: k=8..9 for row_group  
-    //   A[2]: k=0..1 for row_group+8
-    //   A[3]: k=8..9 for row_group+8
-    
-    // B fragment layout for m16n8k16:
-    //   B[0]: k=0..1 for col_group (cols 0-7 depending on lane)
-    //   B[1]: k=8..9 for col_group
-    
-    // For m8n8k4, each thread needs specific A and B values that we 
-    // need to shuffle from the m16n8k16 fragment holders
-    
-    // Process in 4 k-steps (k=0-3, 4-7, 8-11, 12-15) and 2 row blocks
-    
-    // The m8n8k4 instruction expects:
-    // - Thread t's A input covers row (t/4) of the 8x4 A tile
-    // - Thread t's B input covers col (t/4) of the 4x8 B tile
-    
-    int row_in_8 = lane / 4;      // 0-7: which row within 8-row block
-    int col_group = lane % 4;     // 0-3: which column pair (for k indexing)
-    
-    // m8n8k4 output layout: each thread gets 8 floats covering
-    // C[row_in_8][0..7] but we only need C[row_in_8][0..7] from the 8-col result
-    // mapped to our 8-col output
-    
-    float c8x8_top[8] = {0,0,0,0,0,0,0,0};
-    float c8x8_bot[8] = {0,0,0,0,0,0,0,0};
-    
-    // K-loop: 4 iterations of k=4
-    #pragma unroll
-    for (int k_iter = 0; k_iter < 4; k_iter++) {
-        // Determine which A/B registers contain data for this k_iter
-        // k_iter 0: k=0-3, uses A[0] k positions 0,1 and needs k positions 2,3 from neighbors
-        // k_iter 1: k=4-7, uses A[0] k positions 4,5,6,7 (but wait, A[0] only has 2 k values...)
-        
-        // Actually, the m16n8k16 fragment packs k values differently:
-        // A[0] has k=0,1 (col_pair*2, col_pair*2+1 where col_pair = lane%4)
-        // A[1] has k=8,9 (same positions + 8)
-        // So threads 0-3 have k=0,1; threads 4-7 have k=2,3; etc.
-        
-        // For k_iter covering k=[k_iter*4, k_iter*4+3]:
-        // We need to gather k values from the appropriate threads
-        
-        int k_base = k_iter * 4;
-        
-        // Source thread for k=k_base has (k_base/2) in its col_pair
-        // k_base=0: col_pair=0 (threads 0,4,8,12,16,20,24,28 for their respective rows)
-        // k_base=4: col_pair=2
-        // k_base=8: col_pair=0 (but in A[1])
-        // k_base=12: col_pair=2 (in A[1])
-        
-        int a_reg_idx = (k_base >= 8) ? 1 : 0;  // A[0] for k<8, A[1] for k>=8
-        int k_offset = k_base % 8;               // 0 or 4
-        int src_col_pair = k_offset / 2;         // 0 or 2
-        
-        // Get A values for this thread's row
-        // We need a[k_base], a[k_base+1], a[k_base+2], a[k_base+3]
-        // These come from col_pair=k_offset/2 and col_pair=k_offset/2+1
-        
-        int src_lane_base0 = (lane / 4) * 4 + src_col_pair;      // Same row, col_pair for k,k+1
-        int src_lane_base1 = (lane / 4) * 4 + src_col_pair + 1;  // Same row, col_pair for k+2,k+3
-        
-        // Top 8 rows (m=0..7): use A[0] or A[1] based on k_base
-        uint32_t a_top_01 = __shfl_sync(FULL_MASK, A[a_reg_idx], src_lane_base0);
-        uint32_t a_top_23 = __shfl_sync(FULL_MASK, A[a_reg_idx], src_lane_base1);
-        
-        // Bottom 8 rows (m=8..15): use A[2] or A[3]
-        uint32_t a_bot_01 = __shfl_sync(FULL_MASK, A[a_reg_idx + 2], src_lane_base0);
-        uint32_t a_bot_23 = __shfl_sync(FULL_MASK, A[a_reg_idx + 2], src_lane_base1);
-        
-        // Get B values for this k_iter
-        // B[0] has k=0,1 for col=(lane/4)
-        // B[1] has k=8,9 for col=(lane/4)
-        // We need b[k_base][col], b[k_base+1][col], etc.
-        
-        int b_reg_idx = (k_base >= 8) ? 1 : 0;
-        int b_k_pair = k_offset / 2;  // 0 or 2
-        
-        // For B, each thread already has the right column, just need right k pair
-        int b_src_lane0 = lane - (lane % 4) + b_k_pair;      // k,k+1
-        int b_src_lane1 = lane - (lane % 4) + b_k_pair + 1;  // k+2,k+3
-        
-        uint32_t b_01 = __shfl_sync(FULL_MASK, B[b_reg_idx], b_src_lane0);
-        uint32_t b_23 = __shfl_sync(FULL_MASK, B[b_reg_idx], b_src_lane1);
-        
-        // Now do two m8n8k4 calls for top and bottom row blocks
-        // First k=0,1 then k=2,3
-        
-        // m8n8k4 for top rows, k=0,1
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
-            "{%0, %1, %2, %3, %4, %5, %6, %7};"
-            : "+f"(c8x8_top[0]), "+f"(c8x8_top[1]), "+f"(c8x8_top[2]), "+f"(c8x8_top[3]),
-              "+f"(c8x8_top[4]), "+f"(c8x8_top[5]), "+f"(c8x8_top[6]), "+f"(c8x8_top[7])
-            : "r"(a_top_01), "r"(a_top_01), "r"(b_01), "r"(b_01));
-        
-        // m8n8k4 for top rows, k=2,3
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
-            "{%0, %1, %2, %3, %4, %5, %6, %7};"
-            : "+f"(c8x8_top[0]), "+f"(c8x8_top[1]), "+f"(c8x8_top[2]), "+f"(c8x8_top[3]),
-              "+f"(c8x8_top[4]), "+f"(c8x8_top[5]), "+f"(c8x8_top[6]), "+f"(c8x8_top[7])
-            : "r"(a_top_23), "r"(a_top_23), "r"(b_23), "r"(b_23));
-        
-        // m8n8k4 for bottom rows, k=0,1
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
-            "{%0, %1, %2, %3, %4, %5, %6, %7};"
-            : "+f"(c8x8_bot[0]), "+f"(c8x8_bot[1]), "+f"(c8x8_bot[2]), "+f"(c8x8_bot[3]),
-              "+f"(c8x8_bot[4]), "+f"(c8x8_bot[5]), "+f"(c8x8_bot[6]), "+f"(c8x8_bot[7])
-            : "r"(a_bot_01), "r"(a_bot_01), "r"(b_01), "r"(b_01));
-        
-        // m8n8k4 for bottom rows, k=2,3
-        asm volatile(
-            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
-            "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, {%10, %11}, "
-            "{%0, %1, %2, %3, %4, %5, %6, %7};"
-            : "+f"(c8x8_bot[0]), "+f"(c8x8_bot[1]), "+f"(c8x8_bot[2]), "+f"(c8x8_bot[3]),
-              "+f"(c8x8_bot[4]), "+f"(c8x8_bot[5]), "+f"(c8x8_bot[6]), "+f"(c8x8_bot[7])
-            : "r"(a_bot_23), "r"(a_bot_23), "r"(b_23), "r"(b_23));
+    // Initialize C to zero
+    for (int i = lane; i < 16 * 8; i += 32) {
+        sh_C[i] = 0.0f;
     }
     
-    // Extract results from m8n8k4 output layout to m16n8k16 output layout
-    // m8n8k4 output: thread t gets C[t/4][(t%4)*2] and C[t/4][(t%4)*2+1] 
-    //               plus C[t/4+4][(t%4)*2] and C[t/4+4][(t%4)*2+1] in the 8 floats
-    // Mapping: c8x8[0,1] = row t/4, cols 0-1 if t%4==0, cols 2-3 if t%4==1, etc.
-    //          c8x8[2,3] = row t/4, cols 0-1 or 2-3 (offset)
-    //          c8x8[4,5] = row t/4+4, cols ...
-    //          c8x8[6,7] = row t/4+4, cols ...
+    // Unpack A fragment from m16n8k16 layout to shared memory
+    // A fragment layout: lane = row_group*4 + col_pair
+    //   A[0]: (k=col_pair*2, col_pair*2+1) for row_group (rows 0-7)
+    //   A[1]: (k=col_pair*2+8, col_pair*2+9) for row_group
+    //   A[2]: (k=col_pair*2, col_pair*2+1) for row_group+8
+    //   A[3]: (k=col_pair*2+8, col_pair*2+9) for row_group+8
+    const half2* a_h2 = reinterpret_cast<const half2*>(A);
+    int row_group = lane / 4;
+    int col_pair = lane % 4;
     
-    // m16n8k16 output layout: frag_c[4] where
-    //   frag_c[0] = C[lane/4][(lane%4)*2]
-    //   frag_c[1] = C[lane/4][(lane%4)*2+1]
-    //   frag_c[2] = C[lane/4+8][(lane%4)*2]
-    //   frag_c[3] = C[lane/4+8][(lane%4)*2+1]
+    half2 a0 = a_h2[0];
+    sh_A[row_group * 16 + col_pair * 2 + 0] = __low2half(a0);
+    sh_A[row_group * 16 + col_pair * 2 + 1] = __high2half(a0);
     
-    // The m8n8k4 produces an 8x8 result matrix. We only need columns 0-7 (all of them for n=8).
-    // Rows 0-7 go to top block, conceptually this is correct.
+    half2 a1 = a_h2[1];
+    sh_A[row_group * 16 + col_pair * 2 + 8] = __low2half(a1);
+    sh_A[row_group * 16 + col_pair * 2 + 9] = __high2half(a1);
     
-    // For m8n8k4, per-thread mapping (row.col layout):
-    // Thread t owns: C[t/4, (t%4)*2], C[t/4, (t%4)*2+1], C[t/4+4, (t%4)*2], C[t/4+4, (t%4)*2+1]
-    // These are stored in c[0], c[1], c[4], c[5] for the first pair
-    // and c[2], c[3], c[6], c[7] for... wait, need to verify the exact layout
+    half2 a2 = a_h2[2];
+    sh_A[(row_group + 8) * 16 + col_pair * 2 + 0] = __low2half(a2);
+    sh_A[(row_group + 8) * 16 + col_pair * 2 + 1] = __high2half(a2);
     
-    // Actually for m8n8k4 with row.col:
-    // c[0] = C[t/4, (t%4)*2]
-    // c[1] = C[t/4, (t%4)*2+1]  
-    // c[2] = C[t/4+4, (t%4)*2]
-    // c[3] = C[t/4+4, (t%4)*2+1]
-    // c[4..7] unused? Or contains more columns?
+    half2 a3 = a_h2[3];
+    sh_A[(row_group + 8) * 16 + col_pair * 2 + 8] = __low2half(a3);
+    sh_A[(row_group + 8) * 16 + col_pair * 2 + 9] = __high2half(a3);
     
-    // Let me use the documented layout. For now, assume simplified extraction:
-    int out_row = lane / 4;       // 0-7
-    int out_col = (lane % 4) * 2; // 0,2,4,6
+    // Unpack B fragment to shared memory
+    // B fragment layout: lane = b_col*4 + k_pair
+    //   B[0]: (k=k_pair*2, k_pair*2+1) for column b_col
+    //   B[1]: (k=k_pair*2+8, k_pair*2+9) for column b_col
+    const half2* b_h2 = reinterpret_cast<const half2*>(B);
+    int b_col = lane / 4;
+    int k_pair = lane % 4;
     
-    // Top block results
-    frag_c[0] += c8x8_top[0];  // C[out_row][out_col]
-    frag_c[1] += c8x8_top[1];  // C[out_row][out_col+1]
+    half2 b0 = b_h2[0];
+    sh_B[(k_pair * 2 + 0) * 8 + b_col] = __low2half(b0);
+    sh_B[(k_pair * 2 + 1) * 8 + b_col] = __high2half(b0);
     
-    // Bottom block results  
-    frag_c[2] += c8x8_bot[0];  // C[out_row+8][out_col]
-    frag_c[3] += c8x8_bot[1];  // C[out_row+8][out_col+1]
+    half2 b1 = b_h2[1];
+    sh_B[(k_pair * 2 + 8) * 8 + b_col] = __low2half(b1);
+    sh_B[(k_pair * 2 + 9) * 8 + b_col] = __high2half(b1);
+    
+    __syncwarp();
+    
+    // QuadPair: only lanes {0,1,2,3,16,17,18,19} participate in m8n8k4
+    bool participates = (lane < 4) || (lane >= 16 && lane < 20);
+    int logical_tid = participates ? ((lane < 4) ? lane : (lane - 16 + 4)) : 0;
+    
+    // Compute C[16x8] = A[16x16] * B[16x8]
+    // Using m8n8k4: 2 row blocks × 4 k blocks
+    for (int row_block = 0; row_block < 2; row_block++) {
+        for (int k_block = 0; k_block < 4; k_block++) {
+            int row_offset = row_block * 8;
+            int k_offset = k_block * 4;
+            
+            // Load A fragment: thread t loads A[row_offset + t, k_offset : k_offset+4]
+            uint32_t a0_reg = 0, a1_reg = 0;
+            if (participates) {
+                int a_row = row_offset + logical_tid;
+                half a_k0 = sh_A[a_row * 16 + k_offset + 0];
+                half a_k1 = sh_A[a_row * 16 + k_offset + 1];
+                half a_k2 = sh_A[a_row * 16 + k_offset + 2];
+                half a_k3 = sh_A[a_row * 16 + k_offset + 3];
+                
+                half2 a01 = __halves2half2(a_k0, a_k1);
+                half2 a23 = __halves2half2(a_k2, a_k3);
+                a0_reg = *reinterpret_cast<uint32_t*>(&a01);
+                a1_reg = *reinterpret_cast<uint32_t*>(&a23);
+            }
+            
+            // Load B fragment: thread t loads B[k_offset : k_offset+4, t]
+            uint32_t b0_reg = 0, b1_reg = 0;
+            if (participates) {
+                int b_col_idx = logical_tid;
+                half b_k0 = sh_B[(k_offset + 0) * 8 + b_col_idx];
+                half b_k1 = sh_B[(k_offset + 1) * 8 + b_col_idx];
+                half b_k2 = sh_B[(k_offset + 2) * 8 + b_col_idx];
+                half b_k3 = sh_B[(k_offset + 3) * 8 + b_col_idx];
+                
+                half2 b01 = __halves2half2(b_k0, b_k1);
+                half2 b23 = __halves2half2(b_k2, b_k3);
+                b0_reg = *reinterpret_cast<uint32_t*>(&b01);
+                b1_reg = *reinterpret_cast<uint32_t*>(&b23);
+            }
+            
+            // Execute m8n8k4
+            float c[8] = {0,0,0,0,0,0,0,0};
+            
+            asm volatile(
+                "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                "{%0, %1, %2, %3, %4, %5, %6, %7}, "
+                "{%8, %9}, {%10, %11}, "
+                "{%0, %1, %2, %3, %4, %5, %6, %7};"
+                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]),
+                  "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                : "r"(a0_reg), "r"(a1_reg), "r"(b0_reg), "r"(b1_reg));
+            
+            // Store results using SM70_8x8_32b layout exactly as documented
+            // index = t0*1 + t1*16 + t2*4 + v0*8 + v1*2 + v2*32
+            // m = index % 8, n = index / 8
+            if (participates) {
+                int t = logical_tid;
+                int t0 = t & 1;
+                int t1 = (t >> 1) & 1;
+                int t2 = (t >> 2) & 1;
+                
+                #pragma unroll
+                for (int v = 0; v < 8; v++) {
+                    int v0 = v & 1;
+                    int v1 = (v >> 1) & 1;
+                    int v2 = (v >> 2) & 1;
+                    
+                    int index = t0*1 + t1*16 + t2*4 + v0*8 + v1*2 + v2*32;
+                    int m = index % 8;
+                    int n = index / 8;
+                    
+                    atomicAdd(&sh_C[(row_offset + m) * 8 + n], c[v]);
+                }
+            }
+            
+            __syncwarp();
+        }
+    }
+    
+    __syncwarp();
+    
+    // Extract results in Marlin m16n8k16 layout
+    int c_row0 = lane / 4;
+    int c_col0 = (lane % 4) * 2;
+    frag_c[0] = sh_C[c_row0 * 8 + c_col0];
+    frag_c[1] = sh_C[c_row0 * 8 + c_col0 + 1];
+    frag_c[2] = sh_C[(c_row0 + 8) * 8 + c_col0];
+    frag_c[3] = sh_C[(c_row0 + 8) * 8 + c_col0 + 1];
 }
 
 __device__ void mma_m16n8k16_sm70_trans(const uint32_t* A, const uint32_t* B,
