@@ -11,19 +11,25 @@
  * 1. m8n8k4 tensor core emulation for Volta (only native instruction)
  * 2. Quadpair thread mapping (lanes 0-3, 16-19)
  * 3. Fragment layout transformations (Marlin <-> m8n8k4)
- * 4. Fused ldmatrix+MMA approach (DEFAULT - ~5-39% faster)
- * 5. Register-based MMA approach (legacy, for pre-loaded fragments)
- * 6. FP32 accumulation (prevents overflow)
- * 7. ldmatrix emulation via shuffles
+ * 4. Register-based MMA for quantized flow (dequantize -> MMA)
+ * 5. FP32 accumulation (prevents overflow)
+ * 6. ldmatrix emulation via shuffles
+ *
+ * NOTE ON QUANTIZED KERNELS:
+ * --------------------------
+ * For Marlin's quantized flow, we use the register-based MMA approach because:
+ * - Quantized weights require dequantization BEFORE the MMA operation
+ * - The data flow is: load quantized -> dequantize to FP16 -> pack fragments -> MMA
+ * - This is different from pure FP16 workflows where data can go directly
+ *   from shared memory to tensor cores
  *
  * TEST CATEGORIES:
  * ----------------
  * Section 1: Correctness Tests (CPU reference comparison)
  * Section 2: Numerical Edge Cases (NaN, Inf, denormals, saturation)
  * Section 3: Stress Tests (repeated MMA, multi-block, race conditions)
- * Section 4: Performance Benchmarks (all implementations)
- * Section 5: Register Pressure Analysis
- * Section 6: Implementation Comparison (fused vs register-based)
+ * Section 4: Performance Benchmarks
+ * Section 5: Pattern Tests (identity, checkerboard, diagonal)
  *
  * USAGE:
  * ------
@@ -239,10 +245,10 @@ __global__ void kernel_mma_register_based(
     C_out[(row + 8) * 8 + col + 1] = frag_c[3];
 }
 
-// Test fused ldmatrix+MMA (DEFAULT)
+// Test shared memory based MMA (loads from smem, packs fragments, calls register-based MMA)
 // Input A: 16x16 row-major
 // Input B: 16x8 row-major (will be transposed to column-major in shared)
-__global__ void kernel_mma_fused(
+__global__ void kernel_mma_smem_based(
     const half* A_global,  // 16x16 row-major
     const half* B_global,  // 16x8 row-major
     float* C_out
@@ -281,33 +287,30 @@ __global__ void kernel_mma_fused(
     if (tid >= 32) return;
     
     float frag_c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    fused_ldmatrix_mma_m16n8k16_sm70(sh_A, sh_B, frag_c, 16, 16);
     
+    // Pack fragments and use register-based MMA
+    uint32_t frag_a[4], frag_b[2];
     int row = tid / 4;
-    int col = (tid % 4) * 2;
-    C_out[(row + 0) * 8 + col + 0] = frag_c[0];
-    C_out[(row + 0) * 8 + col + 1] = frag_c[1];
-    C_out[(row + 8) * 8 + col + 0] = frag_c[2];
-    C_out[(row + 8) * 8 + col + 1] = frag_c[3];
-}
-
-// Test K=32 version
-__global__ void kernel_mma_k32(
-    const uint32_t* frag_a_all,  // 32 threads * 8 uint32
-    const uint32_t* frag_b_all,  // 32 threads * 4 uint32
-    float* C_out
-) {
-    int tid = threadIdx.x % 32;
+    int kp = tid % 4;
+    half2 h0 = __halves2half2(sh_A[row * 16 + kp * 2], sh_A[row * 16 + kp * 2 + 1]);
+    half2 h1 = __halves2half2(sh_A[row * 16 + kp * 2 + 8], sh_A[row * 16 + kp * 2 + 9]);
+    half2 h2 = __halves2half2(sh_A[(row + 8) * 16 + kp * 2], sh_A[(row + 8) * 16 + kp * 2 + 1]);
+    half2 h3 = __halves2half2(sh_A[(row + 8) * 16 + kp * 2 + 8], sh_A[(row + 8) * 16 + kp * 2 + 9]);
+    frag_a[0] = *reinterpret_cast<uint32_t*>(&h0);
+    frag_a[1] = *reinterpret_cast<uint32_t*>(&h1);
+    frag_a[2] = *reinterpret_cast<uint32_t*>(&h2);
+    frag_a[3] = *reinterpret_cast<uint32_t*>(&h3);
     
-    uint32_t frag_a[8], frag_b[4];
-    for (int i = 0; i < 8; i++) frag_a[i] = frag_a_all[tid * 8 + i];
-    for (int i = 0; i < 4; i++) frag_b[i] = frag_b_all[tid * 4 + i];
+    int col = tid / 4;
+    half2 b0 = __halves2half2(sh_B[col * 16 + kp * 2], sh_B[col * 16 + kp * 2 + 1]);
+    half2 b1 = __halves2half2(sh_B[col * 16 + kp * 2 + 8], sh_B[col * 16 + kp * 2 + 9]);
+    frag_b[0] = *reinterpret_cast<uint32_t*>(&b0);
+    frag_b[1] = *reinterpret_cast<uint32_t*>(&b1);
     
-    float frag_c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    mma_m16n8k32_sm70(frag_a, frag_b, frag_c);
+    mma_m16n8k16_sm70(frag_a, frag_b, frag_c);
     
-    int row = tid / 4;
-    int col = (tid % 4) * 2;
+    row = tid / 4;
+    col = (tid % 4) * 2;
     C_out[(row + 0) * 8 + col + 0] = frag_c[0];
     C_out[(row + 0) * 8 + col + 1] = frag_c[1];
     C_out[(row + 8) * 8 + col + 0] = frag_c[2];
@@ -426,50 +429,6 @@ __global__ void bench_register_mma(
     }
 }
 
-// Benchmark: Fused MMA
-__global__ void bench_fused_mma(
-    const half* A_global,
-    const half* B_global,
-    float* C_out,
-    int iterations
-) {
-    __shared__ half sh_A[16 * 16];
-    __shared__ half sh_B[8 * 16];
-    
-    int tid = threadIdx.x;
-    int wid = tid / 32;
-    int lane = tid % 32;
-    
-    // Load to shared memory once (first warp does the load)
-    if (wid == 0) {
-        // Load A row-major
-        for (int i = 0; i < 8; i++) {
-            sh_A[lane * 8 + i] = A_global[lane * 8 + i];
-        }
-        // Load B and convert to column-major
-        for (int i = 0; i < 4; i++) {
-            int idx = lane * 4 + i;
-            if (idx < 128) {
-                int k = idx / 8;
-                int col = idx % 8;
-                sh_B[col * 16 + k] = B_global[k * 8 + col];
-            }
-        }
-    }
-    __syncthreads();
-    
-    float frag_c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    
-    #pragma unroll 1
-    for (int iter = 0; iter < iterations; iter++) {
-        fused_ldmatrix_mma_m16n8k16_sm70(sh_A, sh_B, frag_c, 16, 16);
-    }
-    
-    if (lane == 0 && wid == 0 && blockIdx.x == 0) {
-        C_out[0] = frag_c[0];
-    }
-}
-
 // Benchmark: Register pressure test (multiple concurrent MMAs)
 __global__ void bench_register_pressure(
     const uint32_t* frag_a,
@@ -507,50 +466,6 @@ __global__ void bench_register_pressure(
     }
     
     if (tid == 0 && blockIdx.x == 0) {
-        C_out[0] = c0[0] + c1[0] + c2[0] + c3[0];
-    }
-}
-
-__global__ void bench_fused_register_pressure(
-    const half* A_global,
-    const half* B_global,
-    float* C_out,
-    int iterations
-) {
-    __shared__ half sh_A[16 * 16];
-    __shared__ half sh_B[8 * 16];
-    
-    int tid = threadIdx.x;
-    int lane = tid % 32;
-    int wid = tid / 32;
-    
-    // First warp loads shared memory
-    if (wid == 0) {
-        for (int i = 0; i < 8; i++) {
-            sh_A[lane * 8 + i] = A_global[lane * 8 + i];
-        }
-        for (int i = 0; i < 4; i++) {
-            int idx = lane * 4 + i;
-            if (idx < 128) {
-                int k = idx / 8;
-                int col = idx % 8;
-                sh_B[col * 16 + k] = B_global[k * 8 + col];
-            }
-        }
-    }
-    __syncthreads();
-    
-    float c0[4] = {0}, c1[4] = {0}, c2[4] = {0}, c3[4] = {0};
-    
-    #pragma unroll 1
-    for (int iter = 0; iter < iterations; iter++) {
-        fused_ldmatrix_mma_m16n8k16_sm70(sh_A, sh_B, c0, 16, 16);
-        fused_ldmatrix_mma_m16n8k16_sm70(sh_A, sh_B, c1, 16, 16);
-        fused_ldmatrix_mma_m16n8k16_sm70(sh_A, sh_B, c2, 16, 16);
-        fused_ldmatrix_mma_m16n8k16_sm70(sh_A, sh_B, c3, 16, 16);
-    }
-    
-    if (lane == 0 && blockIdx.x == 0) {
         C_out[0] = c0[0] + c1[0] + c2[0] + c3[0];
     }
 }
@@ -614,7 +529,7 @@ bool test_correctness_register_based() {
     }
 }
 
-bool test_correctness_fused() {
+bool test_correctness_smem_based() {
     const int M = 16, N = 8, K = 16;
     
     std::vector<half> A(M * K), B(K * N);
@@ -637,7 +552,7 @@ bool test_correctness_fused() {
     CUDA_CHECK(cudaMemcpy(d_a, A.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b, B.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
     
-    kernel_mma_fused<<<1, 64>>>(d_a, d_b, d_c);
+    kernel_mma_smem_based<<<1, 64>>>(d_a, d_b, d_c);
     CUDA_CHECK(cudaGetLastError());
     
     CUDA_CHECK(cudaMemcpy(C_gpu.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
@@ -647,61 +562,9 @@ bool test_correctness_fused() {
     float max_diff = max_abs_diff(C_cpu.data(), C_gpu.data(), M * N);
     
     char buf[128];
-    snprintf(buf, sizeof(buf), "Fused ldmatrix+MMA (max_diff=%.6f)", max_diff);
+    snprintf(buf, sizeof(buf), "Shared memory based MMA (max_diff=%.6f)", max_diff);
     
     if (max_diff < 0.01f) {
-        print_pass(buf);
-        return true;
-    } else {
-        print_fail(buf);
-        return false;
-    }
-}
-
-bool test_correctness_consistency() {
-    // Verify both implementations produce identical results
-    const int M = 16, N = 8, K = 16;
-    
-    std::vector<half> A(M * K), B(K * N);
-    std::vector<float> C_reg(M * N), C_fused(M * N);
-    
-    // Use all 1.0 for easy verification
-    for (int i = 0; i < M * K; i++) A[i] = __float2half(1.0f);
-    for (int i = 0; i < K * N; i++) B[i] = __float2half(1.0f);
-    
-    // Register-based
-    std::vector<uint32_t> frag_a(32 * 4), frag_b(32 * 2);
-    pack_marlin_fragments(A.data(), B.data(), frag_a.data(), frag_b.data());
-    
-    uint32_t *d_frag_a, *d_frag_b;
-    half *d_a, *d_b;
-    float *d_c;
-    
-    CUDA_CHECK(cudaMalloc(&d_frag_a, frag_a.size() * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_frag_b, frag_b.size() * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_a, M * K * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_b, K * N * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_c, M * N * sizeof(float)));
-    
-    CUDA_CHECK(cudaMemcpy(d_frag_a, frag_a.data(), frag_a.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_frag_b, frag_b.data(), frag_b.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_a, A.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, B.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
-    
-    kernel_mma_register_based<<<1, 32>>>(d_frag_a, d_frag_b, d_c);
-    CUDA_CHECK(cudaMemcpy(C_reg.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    kernel_mma_fused<<<1, 64>>>(d_a, d_b, d_c);
-    CUDA_CHECK(cudaMemcpy(C_fused.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    cudaFree(d_frag_a); cudaFree(d_frag_b); cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    
-    float max_diff = max_abs_diff(C_reg.data(), C_fused.data(), M * N);
-    
-    char buf[128];
-    snprintf(buf, sizeof(buf), "Register vs Fused consistency (max_diff=%.6f)", max_diff);
-    
-    if (max_diff < 0.001f) {
         print_pass(buf);
         return true;
     } else {
@@ -1049,18 +912,13 @@ void run_benchmarks() {
            M, K, N, iterations, flops_per_mma);
     printf("  └─────────────────────────────────────────────────────────────────────┘\n\n");
     
-    // Benchmark 1: Single warp, register-based
+    // Benchmark 1: Single warp performance
     print_subheader("Single Warp Performance");
     {
         auto result = run_benchmark("Register-based MMA", [&]() {
             bench_register_mma<<<1, 32>>>(d_frag_a, d_frag_b, d_c, iterations);
         }, iterations, flops_per_mma);
         printf("    Register-based:  %8.2f GFLOPS  (%6.3f ms)\n", result.gflops, result.ms);
-        
-        result = run_benchmark("Fused MMA", [&]() {
-            bench_fused_mma<<<1, 32>>>(d_a, d_b, d_c, iterations);
-        }, iterations, flops_per_mma);
-        printf("    Fused (DEFAULT): %8.2f GFLOPS  (%6.3f ms)\n", result.gflops, result.ms);
     }
     
     // Benchmark 2: Multi-warp (compute bound)
@@ -1071,11 +929,6 @@ void run_benchmarks() {
             bench_register_mma<<<warps, 32>>>(d_frag_a, d_frag_b, d_c, iterations);
         }, iterations * warps, flops_per_mma);
         printf("    Register-based:  %8.2f GFLOPS  (%d warps)\n", result.gflops, warps);
-        
-        result = run_benchmark("Fused MMA", [&]() {
-            bench_fused_mma<<<warps, 32>>>(d_a, d_b, d_c, iterations);
-        }, iterations * warps, flops_per_mma);
-        printf("    Fused (DEFAULT): %8.2f GFLOPS  (%d warps)\n", result.gflops, warps);
     }
     
     // Benchmark 3: Register pressure
@@ -1086,21 +939,16 @@ void run_benchmarks() {
             bench_register_pressure<<<4, 32>>>(d_frag_a, d_frag_b, d_c, iters);
         }, iters * 4 * 4, flops_per_mma);  // 4 blocks * 4 MMAs
         printf("    Register-based:  %8.2f GFLOPS\n", result.gflops);
-        
-        result = run_benchmark("Fused MMA", [&]() {
-            bench_fused_register_pressure<<<4, 32>>>(d_a, d_b, d_c, iters);
-        }, iters * 4 * 4, flops_per_mma);
-        printf("    Fused (DEFAULT): %8.2f GFLOPS\n", result.gflops);
     }
     
     // Summary
     printf("\n");
     printf("  ┌─────────────────────────────────────────────────────────────────────┐\n");
-    printf("  │  DESIGN DECISION VALIDATION                                         │\n");
+    printf("  │  SM70 TENSOR CORE PERFORMANCE                                       │\n");
     printf("  │  ─────────────────────────────────────────────────────────────────  │\n");
-    printf("  │  • Fused approach is DEFAULT for ~5-39%% speedup                    │\n");
-    printf("  │  • Greatest benefit under register pressure                         │\n");
-    printf("  │  • Both approaches produce identical results                        │\n");
+    printf("  │  • m8n8k4 emulation via 4 m8n8k4 ops per m16n8k16                   │\n");
+    printf("  │  • Register-based MMA for pre-dequantized fragments                 │\n");
+    printf("  │  • FP32 accumulation for numerical stability                        │\n");
     printf("  └─────────────────────────────────────────────────────────────────────┘\n");
     
     cudaFree(d_frag_a); cudaFree(d_frag_b); cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
@@ -1109,93 +957,6 @@ void run_benchmarks() {
 // =============================================================================
 // Section 5: Additional Variant Tests
 // =============================================================================
-
-// Test K=32 fused variant
-__global__ void kernel_fused_k32(
-    const half* A_global,  // 16x32 row-major
-    const half* B_global,  // 32x8 row-major
-    float* C_out
-) {
-    __shared__ half sh_A[16 * 32];
-    __shared__ half sh_B[8 * 32];  // Column-major
-    
-    int tid = threadIdx.x;
-    
-    // Load A row-major
-    if (tid < 64) {
-        for (int i = 0; i < 8; i++) {
-            sh_A[tid * 8 + i] = A_global[tid * 8 + i];
-        }
-    }
-    // Load B and convert to column-major
-    if (tid < 64) {
-        for (int i = 0; i < 4; i++) {
-            int idx = tid * 4 + i;
-            if (idx < 256) {
-                int k = idx / 8;
-                int col = idx % 8;
-                sh_B[col * 32 + k] = B_global[k * 8 + col];
-            }
-        }
-    }
-    __syncthreads();
-    
-    if (tid >= 32) return;
-    
-    float frag_c[4] = {0};
-    fused_ldmatrix_mma_m16n8k32_sm70(sh_A, sh_B, frag_c, 32, 32);
-    
-    int row = tid / 4;
-    int col = (tid % 4) * 2;
-    C_out[(row + 0) * 8 + col + 0] = frag_c[0];
-    C_out[(row + 0) * 8 + col + 1] = frag_c[1];
-    C_out[(row + 8) * 8 + col + 0] = frag_c[2];
-    C_out[(row + 8) * 8 + col + 1] = frag_c[3];
-}
-
-bool test_fused_k32() {
-    const int M = 16, N = 8, K = 32;
-    
-    std::vector<half> A(M * K), B(K * N);
-    std::vector<float> C_cpu(M * N), C_gpu(M * N);
-    
-    std::mt19937 rng(42);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    
-    for (int i = 0; i < M * K; i++) A[i] = __float2half(dist(rng));
-    for (int i = 0; i < K * N; i++) B[i] = __float2half(dist(rng));
-    
-    matmul_cpu_f16_f32(A.data(), B.data(), C_cpu.data(), M, N, K);
-    
-    half *d_a, *d_b;
-    float *d_c;
-    CUDA_CHECK(cudaMalloc(&d_a, M * K * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_b, K * N * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&d_c, M * N * sizeof(float)));
-    
-    CUDA_CHECK(cudaMemcpy(d_a, A.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b, B.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
-    
-    kernel_fused_k32<<<1, 64>>>(d_a, d_b, d_c);
-    CUDA_CHECK(cudaGetLastError());
-    
-    CUDA_CHECK(cudaMemcpy(C_gpu.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    
-    float max_diff = max_abs_diff(C_cpu.data(), C_gpu.data(), M * N);
-    
-    char buf[128];
-    snprintf(buf, sizeof(buf), "Fused K=32 MMA (max_diff=%.6f)", max_diff);
-    
-    if (max_diff < 0.02f) {
-        print_pass(buf);
-        return true;
-    } else {
-        print_fail(buf);
-        return false;
-    }
-}
 
 // Test all-ones identity check
 bool test_identity_matrices() {
@@ -1218,7 +979,7 @@ bool test_identity_matrices() {
     CUDA_CHECK(cudaMemcpy(d_a, A.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b, B.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
     
-    kernel_mma_fused<<<1, 64>>>(d_a, d_b, d_c);
+    kernel_mma_smem_based<<<1, 64>>>(d_a, d_b, d_c);
     
     CUDA_CHECK(cudaMemcpy(C_gpu.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
     
@@ -1262,14 +1023,14 @@ bool test_negative_values() {
     CUDA_CHECK(cudaMemcpy(d_a, A.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b, B.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
     
-    kernel_mma_fused<<<1, 64>>>(d_a, d_b, d_c);
-    
+    kernel_mma_smem_based<<<1, 64>>>(d_a, d_b, d_c);
+
     CUDA_CHECK(cudaMemcpy(C_gpu.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    
+
     cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    
+
     float max_diff = max_abs_diff(C_cpu.data(), C_gpu.data(), M * N);
-    
+
     if (max_diff < 0.01f) {
         print_pass("Negative Values (-1 × 1 = -16)");
         return true;
@@ -1309,14 +1070,14 @@ bool test_checkerboard_pattern() {
     CUDA_CHECK(cudaMemcpy(d_a, A.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b, B.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
     
-    kernel_mma_fused<<<1, 64>>>(d_a, d_b, d_c);
-    
+    kernel_mma_smem_based<<<1, 64>>>(d_a, d_b, d_c);
+
     CUDA_CHECK(cudaMemcpy(C_gpu.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    
+
     cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    
+
     float max_diff = max_abs_diff(C_cpu.data(), C_gpu.data(), M * N);
-    
+
     if (max_diff < 0.01f) {
         print_pass("Checkerboard Pattern (detects lane mapping errors)");
         return true;
@@ -1356,14 +1117,14 @@ bool test_diagonal_matrix() {
     CUDA_CHECK(cudaMemcpy(d_a, A.data(), M * K * sizeof(half), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b, B.data(), K * N * sizeof(half), cudaMemcpyHostToDevice));
     
-    kernel_mma_fused<<<1, 64>>>(d_a, d_b, d_c);
-    
+    kernel_mma_smem_based<<<1, 64>>>(d_a, d_b, d_c);
+
     CUDA_CHECK(cudaMemcpy(C_gpu.data(), d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost));
-    
+
     cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
-    
+
     float max_diff = max_abs_diff(C_cpu.data(), C_gpu.data(), M * N);
-    
+
     if (max_diff < 0.01f) {
         print_pass("Diagonal Matrix Test");
         return true;
@@ -1384,9 +1145,6 @@ void run_variant_tests() {
     print_header("SECTION 5: VARIANT & PATTERN TESTS");
     
     int passed = 0, total = 0;
-    
-    print_subheader("K=32 Fused Variant");
-    RUN_TEST(test_fused_k32);
     
     print_subheader("Special Patterns");
     RUN_TEST(test_identity_matrices);
@@ -1412,11 +1170,11 @@ void print_design_summary() {
     printf("  ├─────────────────────────────────────────────────────────────────────┤\n");
     printf("  │  3. FRAGMENT LAYOUT TRANSFORMATIONS                                 │\n");
     printf("  │     Marlin layout <-> m8n8k4 native layout conversions             │\n");
-    printf("  │     → Validated by register vs fused consistency tests             │\n");
+    printf("  │     → Validated by register-based vs smem-based tests              │\n");
     printf("  ├─────────────────────────────────────────────────────────────────────┤\n");
-    printf("  │  4. FUSED LDMATRIX+MMA (DEFAULT)                                    │\n");
-    printf("  │     Direct smem->tensor core, 32 vs 56 shuffles per op             │\n");
-    printf("  │     → Validated by benchmark: ~5-39%% speedup                       │\n");
+    printf("  │  4. REGISTER-BASED MMA FOR QUANTIZED FLOW                           │\n");
+    printf("  │     Dequantized fragments in registers -> MMA                       │\n");
+    printf("  │     → Required for Marlin's quantized kernels                       │\n");
     printf("  ├─────────────────────────────────────────────────────────────────────┤\n");
     printf("  │  5. FP32 ACCUMULATION                                               │\n");
     printf("  │     Prevents overflow (300*300*16 > FP16 max)                       │\n");
@@ -1444,8 +1202,7 @@ void run_correctness_tests() {
     
     print_subheader("CPU Reference Comparison");
     RUN_TEST(test_correctness_register_based);
-    RUN_TEST(test_correctness_fused);
-    RUN_TEST(test_correctness_consistency);
+    RUN_TEST(test_correctness_smem_based);
     
     printf("\n  Results: %d/%d passed\n", passed, total);
 }

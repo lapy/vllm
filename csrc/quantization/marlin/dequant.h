@@ -69,9 +69,6 @@ namespace MARLIN_NAMESPACE_NAME {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 
-// SM70 (Volta) has enlarged FragB (8 elements instead of 2) due to WMMA-based
-// ldmatrix emulation. This helper replicates the standard 2-element dequant
-// output across all 8 elements to match the SM70 MMA data layout requirements.
 // Lookup-table based 3-input logical operation; explicitly used for
 // dequantization as the compiler does not seem to automatically recognize it in
 // all cases.

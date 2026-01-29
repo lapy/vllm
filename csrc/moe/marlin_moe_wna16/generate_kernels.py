@@ -63,15 +63,21 @@ TEMPLATE = (
 
 THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128)]
 
-# SM70-specific configs (Thread K is limited to 16 or 32)
+# SM70 (Volta) compatible configs: thread_k limited to 16 (thread_k_blocks = 1) due to
+# fragment size constraints in the SM70 MMA implementation.
+# Template requires b_sh_wr_iters >= 1, i.e. 8 * (thread_n/16) >= threads =>
+# thread_n >= 2 * threads.
+# Small batch (threads=128): thread_n >= 256, so (16, 256, 128), (16, 384, 128), (16, 512, 128)
+# Large batch (threads=256): thread_n >= 512, so (16, 512, 256), (16, 768, 256), (16, 1024, 256)
 SM70_THREAD_CONFIGS = [
-    (16, 128, 128),
+    # Small batch (threads=128)
     (16, 256, 128),
+    (16, 384, 128),
     (16, 512, 128),
-    (32, 128, 128),
-    (32, 256, 128),
-    (32, 512, 256),
-    (32, 1024, 256),
+    # Large batch (threads=256)
+    (16, 512, 256),
+    (16, 768, 256),
+    (16, 1024, 256),
 ]
 
 THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
@@ -242,7 +248,8 @@ def generate_new_kernels():
                     all_group_blocks, all_m_blocks, SM70_THREAD_CONFIGS
                 ):
                     thread_k, thread_n, threads = thread_configs
-                    if thread_k != 16 and thread_k != 32: continue
+                    # SM70 only supports thread_k=16 (k_size=16) due to fragment size constraints
+                    if thread_k != 16: continue
 
                     if m_blocks <= 1 and threads != 128: continue
                     if m_blocks > 1 and threads != 256: continue
@@ -251,7 +258,7 @@ def generate_new_kernels():
                         "threads": threads,
                         "s_type": s_type,
                         "thread_m_blocks": max(m_blocks, 1),
-                        # thread_k_blocks dictates k_size: 1->16, 2->32
+                        # thread_k_blocks=1 for SM70 (k_size=16 only)
                         "thread_k_blocks": thread_k // 16, 
                         "thread_n_blocks": thread_n // 16,
                         "m_block_size_8": "true" if m_blocks == 0.5 else "false",

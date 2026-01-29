@@ -97,24 +97,8 @@ __device__ inline void mma(
             "r"(c[1]), "r"(c[2]), "r"(c[3]));
     }
   } else if (k_size == 32) {
-    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-    if constexpr (std::is_same<scalar_t, half>::value && !use_fp16_accum) {
-      // SM70 k_size=32 implemented by composing two k_size=16 operations
-      // For k_size=32, fragments are interpreted as having double the K dimension
-      // We split into: first half of K dimension, then second half
-      // Note: This assumes FragA and FragB are large enough (typically FragA[8], FragB[4] for k32)
-      // If fragments are smaller, this will need adjustment based on actual layout
-      mma_m16n8k32_sm70(a, b, reinterpret_cast<float*>(&frag_c));
-    } else {
-      // SM70 doesn't support m16n8k32 for other types - stub implementation
-      // This should not be called on SM70, but we provide a stub to allow compilation
-      // The fragment is left unchanged (no-op) - if this path is executed, results will be incorrect
-      (void)a_frag;
-      (void)frag_b;
-      (void)frag_c;
-      (void)idx;
-    }
-    #else
+    // Note: SM70 does not support k_size=32 for quantized kernels due to fragment
+    // size constraints. All SM70 kernel instantiations use thread_k_blocks=1 (k_size=16).
     if constexpr (std::is_same<scalar_t, __nv_fp8_e4m3>::value) {
       float* c = reinterpret_cast<float*>(&frag_c);
       asm volatile(
@@ -155,7 +139,6 @@ __device__ inline void mma(
             "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
 #endif
     }
-    #endif
   }
 }
 

@@ -132,7 +132,7 @@ thread_config_t small_batch_thread_configs[] = {
     {128, 128, 256},
     {64, 128, 128},
     {128, 64, 128},
-    // SM70 (Volta): thread_k=16 or 32; thread_n>=2*threads for b_sh_wr_iters>=1
+    // SM70 (Volta): thread_k=16 only; thread_n>=2*threads for b_sh_wr_iters>=1
     {16, 256, 128},
     {16, 384, 128},
     {16, 512, 128},
@@ -145,7 +145,7 @@ thread_config_t large_batch_thread_configs[] = {
     {64, 256, 256},
     {64, 128, 128},
     {128, 64, 128},
-    // SM70 (Volta): thread_k=16 or 32; thread_n>=2*threads for b_sh_wr_iters>=1
+    // SM70 (Volta): thread_k=16 only; thread_n>=2*threads for b_sh_wr_iters>=1
     {16, 512, 256},
     {16, 768, 256},
     {16, 1024, 256},
@@ -303,7 +303,7 @@ exec_config_t determine_exec_config(
           ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
           : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
 
-  // Check if we're on SM70 - if so, only consider configs with thread_k = 16 or 32
+  // Check if we're on SM70 - if so, only consider configs with thread_k = 16
   bool is_sm70 = false;
   int current_device = 0;
   cudaGetDevice(&current_device);

@@ -18,13 +18,8 @@
 // QUICK REFERENCE
 // -----------------------------------------------------------------------------
 //
-// Recommended Functions (fused approach - DEFAULT):
-//   fused_ldmatrix_mma_m16n8k16_sm70()  - Direct smem→tensor core, fewer shuffles
-//   fused_ldmatrix_mma_m16n8k32_sm70()  - K=32 fused version
-//
-// Register-based Functions (legacy):
-//   mma_m16n8k16_sm70(A, B, frag_c)     - Uses pre-loaded register fragments
-//   mma_m16n8k32_sm70(A, B, frag_c)     - Double-K version
+// Primary Functions:
+//   mma_m16n8k16_sm70(A, B, frag_c)     - Main MMA operation for quantized GEMM
 //
 // Variant Functions:
 //   mma_m16n8k16_sm70_trans(...)        - Transposed multiply for Marlin
@@ -33,13 +28,6 @@
 // Low-level Primitives:
 //   ldmatrix_m8n8_x1/x2/x4_sm70()       - ldmatrix instruction emulation
 //   mma_m8n8k4_sm70()                   - Direct PTX tensor core wrapper
-//
-// -----------------------------------------------------------------------------
-// RUNTIME SELECTION
-// -----------------------------------------------------------------------------
-//
-//   VLLM_SM70_USE_FUSED_MMA=1 (default)  Use optimized fused approach
-//   VLLM_SM70_USE_FUSED_MMA=0            Use register-based approach
 //
 // -----------------------------------------------------------------------------
 // COMPILATION OPTIONS
@@ -273,25 +261,22 @@ __device__ __forceinline__ void mma_m8n8k4_sm70(
 
 
 // =============================================================================
-// SECTION 4: REGISTER-BASED MMA FUNCTIONS (Legacy)
+// SECTION 4: REGISTER-BASED MMA FUNCTIONS
 // =============================================================================
 //
-// These functions use pre-loaded register fragments. For new code, prefer the
-// fused functions in Section 6 which have better performance.
+// These functions use pre-loaded register fragments for tensor core operations.
 
 // -----------------------------------------------------------------------------
 // 4.1 mma_m16n8k16_sm70 - FROZEN (DO NOT MODIFY)
 // -----------------------------------------------------------------------------
 //
-// Register-based tensor core function. Use fused_ldmatrix_mma_m16n8k16_sm70()
-// for better performance when data is in shared memory.
+// Register-based tensor core function for quantized GEMM kernels.
 // Validated: January 2026, Max error: 0.000000
 //
 /// @brief Computes C[16×8] += A[16×16] × B[16×8] using m8n8k4 tensor cores
 /// @param A FragA in Marlin layout (4 uint32)
 /// @param B FragB in Marlin layout (2 uint32)  
 /// @param frag_c FragC output, accumulated (4 floats)
-/// @note Consider using fused_ldmatrix_mma_m16n8k16_sm70() for better perf
 __device__ __forceinline__ void mma_m16n8k16_sm70(
     const uint32_t* A, 
     const uint32_t* B,
@@ -400,23 +385,6 @@ __device__ __forceinline__ void mma_m16n8k16_sm70(
     
     #undef GATHER_OUTPUT
     #undef TID_TO_LANE
-}
-
-// -----------------------------------------------------------------------------
-// 4.2 mma_m16n8k32_sm70
-// -----------------------------------------------------------------------------
-
-/// @brief Computes C[16×8] += A[16×32] × B[32×8] (two m16n8k16 operations)
-/// @param A FragA array (8 uint32 for K=32)
-/// @param B FragB array (4 uint32 for K=32)
-/// @param frag_c Output accumulator (4 floats)
-__device__ __forceinline__ void mma_m16n8k32_sm70(
-    const uint32_t* A, 
-    const uint32_t* B,
-    float* frag_c) 
-{
-    mma_m16n8k16_sm70(A, B, frag_c);
-    mma_m16n8k16_sm70(A + 4, B + 2, frag_c);
 }
 
 
@@ -541,126 +509,7 @@ __device__ void mma_m16n8k16_sm70_fp16(
 
 
 // =============================================================================
-// SECTION 6: FUSED FUNCTIONS (DEFAULT - RECOMMENDED)
-// =============================================================================
-//
-// These are the DEFAULT and RECOMMENDED functions for SM70 tensor core ops.
-// They load directly from shared memory, eliminating ~24 input shuffles.
-// Provides ~5% speedup at high occupancy, up to ~39% under register pressure.
-//
-// Advantages over register-based approach:
-//   + Fewer shuffles (32 vs 56 per m16n8k16)
-//   + Lower register pressure  
-//   + Better performance under contention
-//
-// Requirements:
-//   - Data must be in shared memory (row-major A, column-major B)
-
-/// @brief Fused load+MMA from shared memory (DEFAULT - USE THIS)
-/// @param sh_A 16x16 row-major A matrix in shared memory
-/// @param sh_B 16x8 column-major B matrix (B[k + col*ldb])
-/// @param frag_c Output in Marlin format, accumulated
-/// @param lda Leading dimension of A (default 16)
-/// @param ldb Leading dimension of B (default 16)
-__device__ __forceinline__ void fused_ldmatrix_mma_m16n8k16_sm70(
-    const half* sh_A,
-    const half* sh_B,
-    float* frag_c,
-    int lda = 16,
-    int ldb = 16)
-{
-    const int lane = threadIdx.x % 32;
-    const int marlin_row = lane / 4;
-    const int marlin_col_pair = lane % 4;
-    const int qp_tid = (lane < 4) ? lane : ((lane >= 16 && lane < 20) ? (lane - 16 + 4) : -1);
-    const bool is_quadpair = (qp_tid >= 0);
-    
-    float c_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    float c_bot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    
-    #pragma unroll
-    for (int kb = 0; kb < 4; kb++) {
-        uint32_t a_top0, a_top1, a_bot0, a_bot1, b0, b1;
-        
-        if (is_quadpair) {
-            // Direct shared memory load - NO INPUT SHUFFLES
-            int row_top = qp_tid;
-            int row_bot = qp_tid + 8;
-            int col = qp_tid;
-            int k_start = kb * 4;
-            
-            const half* a_top_ptr = sh_A + row_top * lda + k_start;
-            const half* a_bot_ptr = sh_A + row_bot * lda + k_start;
-            const half* b_ptr = sh_B + col * ldb + k_start;
-            
-            half2 at0 = __halves2half2(a_top_ptr[0], a_top_ptr[1]);
-            half2 at1 = __halves2half2(a_top_ptr[2], a_top_ptr[3]);
-            half2 ab0 = __halves2half2(a_bot_ptr[0], a_bot_ptr[1]);
-            half2 ab1 = __halves2half2(a_bot_ptr[2], a_bot_ptr[3]);
-            half2 bb0 = __halves2half2(b_ptr[0], b_ptr[1]);
-            half2 bb1 = __halves2half2(b_ptr[2], b_ptr[3]);
-            
-            a_top0 = *reinterpret_cast<uint32_t*>(&at0);
-            a_top1 = *reinterpret_cast<uint32_t*>(&at1);
-            a_bot0 = *reinterpret_cast<uint32_t*>(&ab0);
-            a_bot1 = *reinterpret_cast<uint32_t*>(&ab1);
-            b0 = *reinterpret_cast<uint32_t*>(&bb0);
-            b1 = *reinterpret_cast<uint32_t*>(&bb1);
-        } else {
-            half2 z = __halves2half2(__float2half(0.0f), __float2half(0.0f));
-            uint32_t zv = *reinterpret_cast<uint32_t*>(&z);
-            a_top0 = a_top1 = a_bot0 = a_bot1 = b0 = b1 = zv;
-        }
-        
-        mma_m8n8k4_sm70(a_top0, a_top1, b0, b1, c_top);
-        mma_m8n8k4_sm70(a_bot0, a_bot1, b0, b1, c_bot);
-    }
-    
-    // Output gathering
-    const uint32_t FULL_MASK = 0xFFFFFFFF;
-    
-    #define TID_TO_LANE(t) ((t) < 4 ? (t) : ((t) - 4 + 16))
-    #define GATHER_FUSED(c_arr, row, col, dst_idx) do { \
-        int t = ((row) % 2) + 2 * (((col) / 2) % 2) + 4 * ((row) / 4); \
-        int i = ((col) % 2) + 2 * (((row) / 2) % 2) + 4 * ((col) / 4); \
-        int src_lane = TID_TO_LANE(t); \
-        float vals[8]; \
-        for (int k = 0; k < 8; k++) vals[k] = __shfl_sync(FULL_MASK, c_arr[k], src_lane); \
-        frag_c[dst_idx] += vals[i]; \
-    } while(0)
-    
-    int col0 = marlin_col_pair * 2;
-    int col1 = col0 + 1;
-    
-    GATHER_FUSED(c_top, marlin_row, col0, 0);
-    GATHER_FUSED(c_top, marlin_row, col1, 1);
-    GATHER_FUSED(c_bot, marlin_row, col0, 2);
-    GATHER_FUSED(c_bot, marlin_row, col1, 3);
-    
-    #undef GATHER_FUSED
-    #undef TID_TO_LANE
-}
-
-/// @brief Fused K=32 version (two fused m16n8k16)
-/// @param sh_A 16x32 row-major A matrix
-/// @param sh_B 32x8 column-major B matrix
-/// @param frag_c Output accumulator
-/// @param lda Leading dimension of A (default 32)
-/// @param ldb Leading dimension of B (default 32)
-__device__ __forceinline__ void fused_ldmatrix_mma_m16n8k32_sm70(
-    const half* sh_A,
-    const half* sh_B,
-    float* frag_c,
-    int lda = 32,
-    int ldb = 32)
-{
-    fused_ldmatrix_mma_m16n8k16_sm70(sh_A, sh_B, frag_c, lda, ldb);
-    fused_ldmatrix_mma_m16n8k16_sm70(sh_A + 16, sh_B + 16, frag_c, lda, ldb);
-}
-
-
-// =============================================================================
-// SECTION 7: LEGACY WMMA FUNCTIONS (Optional)
+// SECTION 6: LEGACY WMMA FUNCTIONS (Optional)
 // =============================================================================
 //
 // These functions use NVIDIA's WMMA API. Disabled by default to speed up

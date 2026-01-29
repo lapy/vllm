@@ -62,7 +62,8 @@ TEMPLATE = (
 )
 
 THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128)]
-# SM70 (Volta) compatible configs: thread_k can be 16 (thread_k_blocks = 1) or 32 (thread_k_blocks = 2).
+# SM70 (Volta) compatible configs: thread_k limited to 16 (thread_k_blocks = 1) due to
+# fragment size constraints in the SM70 MMA implementation.
 # Template requires b_sh_wr_iters >= 1, i.e. 8 * (thread_n/16) >= threads =>
 # thread_n >= 2 * threads.
 # Small batch (threads=128): thread_n >= 256, so (16, 256, 128), (16, 384, 128), (16, 512, 128)
@@ -240,14 +241,14 @@ def generate_new_kernels():
                     config_sm75["stages"] = 2
                     sm_75_result_dict[(a_type, b_type, c_type)].append(config_sm75)
 
-            # Generate SM70-specific configs with thread_k = 16 or 32
+            # Generate SM70-specific configs with thread_k = 16 only
             if (a_type, b_type, c_type) in sm_70_result_dict and SUPPORT_SM70:
                 for group_blocks, m_blocks, thread_configs in itertools.product(
                     all_group_blocks, all_m_blocks, SM70_THREAD_CONFIGS
                 ):
                     thread_k, thread_n, threads = thread_configs
-                    # SM70 supports thread_k = 16 (k_size=16) or 32 (k_size=32)
-                    if thread_k != 16 and thread_k != 32:
+                    # SM70 only supports thread_k = 16 (k_size=16) due to fragment size constraints
+                    if thread_k != 16:
                         continue
 
                     # SM70: small batch uses threads=128, large batch uses threads=256
@@ -260,7 +261,7 @@ def generate_new_kernels():
                         "threads": threads,
                         "s_type": s_type,
                         "thread_m_blocks": max(m_blocks, 1),
-                        "thread_k_blocks": thread_k // 16,  # 1 for thread_k=16, 2 for thread_k=32
+                        "thread_k_blocks": thread_k // 16,  # Always 1 for SM70 (k_size=16 only)
                         "thread_n_blocks": thread_n // 16,
                         "m_block_size_8": "true" if m_blocks == 0.5 else "false",
                         "stages": 2,  # SM70 uses 2 stages
