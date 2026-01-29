@@ -1377,6 +1377,9 @@ bool test_diagonal_matrix() {
 // Section 6: Summary & Design Proof
 // =============================================================================
 
+// Test runner macro (used by all test sections)
+#define RUN_TEST(fn) do { total++; if (fn()) passed++; } while(0)
+
 void run_variant_tests() {
     print_header("SECTION 5: VARIANT & PATTERN TESTS");
     
@@ -1433,9 +1436,6 @@ void print_design_summary() {
 // =============================================================================
 // Main Test Runner
 // =============================================================================
-
-// Test runner macro (used by all test sections)
-#define RUN_TEST(fn) do { total++; if (fn()) passed++; } while(0)
 
 void run_correctness_tests() {
     print_header("SECTION 1: CORRECTNESS TESTS");
