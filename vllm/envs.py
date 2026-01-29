@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_SM70_USE_FUSED_MMA: bool = True  # Use fused ldmatrix+MMA on Volta (default)
     VLLM_MXFP4_USE_MARLIN: bool | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1164,6 +1165,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # Whether to use the fused ldmatrix+MMA approach for SM70 (Volta V100).
+    # Use the optimized fused ldmatrix+MMA approach on Volta (SM70) which
+    # eliminates input shuffles and provides ~5-39% speedup (higher under
+    # register pressure). Both implementations are always compiled.
+    # Set to 0 to use the original register-based approach.
+    # NOTE: Kernel modifications needed to pass shared memory pointers directly.
+    "VLLM_SM70_USE_FUSED_MMA": lambda: bool(
+        int(os.getenv("VLLM_SM70_USE_FUSED_MMA", "1"))
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with

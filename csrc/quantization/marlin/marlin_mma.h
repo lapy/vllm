@@ -1,6 +1,6 @@
 #include "marlin_dtypes.cuh"
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-#include "sm70_mma.h"
+#include "marlin_mma_sm70.h"
 #endif
 
 namespace MARLIN_NAMESPACE_NAME {
