@@ -1434,12 +1434,13 @@ void print_design_summary() {
 // Main Test Runner
 // =============================================================================
 
+// Test runner macro (used by all test sections)
+#define RUN_TEST(fn) do { total++; if (fn()) passed++; } while(0)
+
 void run_correctness_tests() {
     print_header("SECTION 1: CORRECTNESS TESTS");
     
     int passed = 0, total = 0;
-    
-    #define RUN_TEST(fn) do { total++; if (fn()) passed++; } while(0)
     
     print_subheader("CPU Reference Comparison");
     RUN_TEST(test_correctness_register_based);
