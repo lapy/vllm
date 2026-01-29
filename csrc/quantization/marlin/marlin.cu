@@ -242,7 +242,7 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
   }
 
   // Verify min for thread K/N
-  // SM70 (Volta) allows thread_k = 16 or 32 (min_thread_k is normally 64)
+  // SM70 (Volta) allows thread_k = 16 (min_thread_k is normally 64)
   int effective_min_thread_k = min_thread_k;
   int major_capability_check = 0;
   int minor_capability_check = 0;
@@ -253,7 +253,7 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
   if (err_major_check == cudaSuccess && err_minor_check == cudaSuccess) {
     int compute_capability_check = major_capability_check * 10 + minor_capability_check;
     if (compute_capability_check == 70) {
-      effective_min_thread_k = 16;  // SM70 supports thread_k = 16 or 32
+      effective_min_thread_k = 16;  // SM70 supports thread_k = 16
     }
   }
   if (th_config.thread_n < min_thread_n || th_config.thread_k < effective_min_thread_k) {
@@ -319,8 +319,10 @@ exec_config_t determine_exec_config(
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
 
-    // For SM70, only allow thread_k = 16 or 32 (k_size=16 or k_size=32)
-    if (is_sm70 && th_config.thread_k != 16 && th_config.thread_k != 32) {
+    // For SM70, only allow thread_k = 16 (thread_k_blocks = 1)
+    // SM70 configs: (16, 256, 128), (16, 384, 128), (16, 512, 128) for small batch
+    //               (16, 512, 256), (16, 768, 256), (16, 1024, 256) for large batch
+    if (is_sm70 && th_config.thread_k != 16) {
       continue;
     }
 
@@ -491,7 +493,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
           is_k_full, has_zp, is_zp_float, is_a_8bit, stages, max_shared_mem,
           sms);
       thread_tfg = exec_cfg.tb_cfg;
-      if (thread_tfg.thread_n != -1) {
+      // Fallback to alternative config for better occupancy, but skip on SM70
+      // SM70 only supports thread_k=16, and {128, 64, 128} has thread_k=128
+      bool is_sm70 = (compute_capability == 70);
+      if (thread_tfg.thread_n != -1 && !is_sm70) {
         if (prob_n / thread_tfg.thread_n *
                 div_ceil(prob_m_split, thread_m_blocks * 16) * 4 <=
             sms) {

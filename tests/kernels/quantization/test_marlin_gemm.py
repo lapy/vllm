@@ -340,6 +340,11 @@ def marlin_generate_valid_test_cases():
         USE_FP32_REDUCE_OPTS,
     )
 
+    # SM70 (Volta) has specific constraints:
+    # - Only FP16 activation supported
+    # - Minimum N is 256 due to thread_n >= 2*threads constraint (threads >= 128)
+    is_sm70 = torch.cuda.get_device_capability() == (7, 0)
+
     def is_invalid(
         a_type,
         b_type,
@@ -372,6 +377,15 @@ def marlin_generate_valid_test_cases():
             return False
         if not act_order and is_k_full:
             return False
+
+        # SM70 constraints
+        if is_sm70:
+            # SM70 only supports FP16 activation
+            if a_type != scalar_types.float16:
+                return False
+            # SM70 minimum N is 256 due to thread config constraints
+            if size_n < 256:
+                return False
 
         return a_type.size_bits < 16 or a_type is c_type
 

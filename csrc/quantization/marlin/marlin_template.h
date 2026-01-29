@@ -130,14 +130,8 @@ __device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 s = MarlinScalarType<type_id>::num2num2(
       reinterpret_cast<scalar_t*>(&frag_s)[i]);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  #pragma unroll
-  for (int j = 0; j < 8; j++)
-    frag_b[j] = __hmul2(frag_b[j], s);
-#else
   frag_b[0] = __hmul2(frag_b[0], s);
   frag_b[1] = __hmul2(frag_b[1], s);
-#endif
 }
 
 template <vllm::ScalarTypeId type_id>
@@ -149,14 +143,8 @@ __device__ inline void scale_and_sub(
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 s2 = MarlinScalarType<type_id>::num2num2(s);
   scalar_t2 zp2 = MarlinScalarType<type_id>::num2num2(zp);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  #pragma unroll
-  for (int j = 0; j < 8; j++)
-    frag_b[j] = __hfma2(frag_b[j], s2, __hneg2(zp2));
-#else
   frag_b[0] = __hfma2(frag_b[0], s2, __hneg2(zp2));
   frag_b[1] = __hfma2(frag_b[1], s2, __hneg2(zp2));
-#endif
 }
 
 template <vllm::ScalarTypeId type_id>
@@ -167,14 +155,8 @@ __device__ inline void sub_zp(
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 zp = MarlinScalarType<type_id>::num2num2(
       reinterpret_cast<scalar_t*>(&frag_zp)[i]);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  #pragma unroll
-  for (int j = 0; j < 8; j++)
-    frag_b[j] = __hsub2(frag_b[j], zp);
-#else
   frag_b[0] = __hsub2(frag_b[0], zp);
   frag_b[1] = __hsub2(frag_b[1], zp);
-#endif
 }
 
 // Same as above, but for act_order (each K is multiplied individually)
@@ -196,16 +178,8 @@ __device__ inline void scale4(
   s_val_3_4.x = reinterpret_cast<scalar_t*>(&frag_s_3)[i];
   s_val_3_4.y = reinterpret_cast<scalar_t*>(&frag_s_4)[i];
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
-  #pragma unroll
-  for (int j = 0; j < 8; j += 2) {
-    frag_b[j] = __hmul2(frag_b[j], s_val_1_2);
-    frag_b[j+1] = __hmul2(frag_b[j+1], s_val_3_4);
-  }
-#else
   frag_b[0] = __hmul2(frag_b[0], s_val_1_2);
   frag_b[1] = __hmul2(frag_b[1], s_val_3_4);
-#endif
 }
 
 // Given 2 floats multiply by 2 scales (halves)

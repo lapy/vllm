@@ -65,13 +65,17 @@ THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128
 # SM70 (Volta) compatible configs: thread_k can be 16 (thread_k_blocks = 1) or 32 (thread_k_blocks = 2).
 # Template requires b_sh_wr_iters >= 1, i.e. 8 * (thread_n/16) >= threads =>
 # thread_n >= 2 * threads.
-# Small batch (threads=128): (16, 256, 128), (16, 384, 128), (16, 512, 128), (32, 256, 128), (32, 384, 128), (32, 512, 128).
-# Large batch (threads=256): (16, 512, 256), (16, 768, 256), (16, 1024, 256), (32, 512, 256), (32, 768, 256), (32, 1024, 256).
+# Small batch (threads=128): thread_n >= 256, so (16, 256, 128), (16, 384, 128), (16, 512, 128)
+# Large batch (threads=256): thread_n >= 512, so (16, 512, 256), (16, 768, 256), (16, 1024, 256)
 SM70_THREAD_CONFIGS = [
+    # Small batch (threads=128)
     (16, 256, 128),
+    (16, 384, 128),
     (16, 512, 128),
-    (32, 512, 256),
-    (32, 1024, 256),
+    # Large batch (threads=256)
+    (16, 512, 256),
+    (16, 768, 256),
+    (16, 1024, 256),
 ]
 
 THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
