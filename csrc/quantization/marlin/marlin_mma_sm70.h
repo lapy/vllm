@@ -320,77 +320,80 @@ __device__ __forceinline__ void mma_m16n8k16_sm70(
     const uint32_t* B,
     float* frag_c) 
 {
+    // ==========================================================================
+    // Emulates m16n8k16 using 8 m8n8k4 operations on Volta (SM70)
+    // 
+    // Marlin fragment layout (lane = row*4 + k_pair):
+    //   A[0]: {A[row, k_pair*2], A[row, k_pair*2+1]}     k=0-7,  rows 0-7
+    //   A[1]: {A[row, k_pair*2+8], A[row, k_pair*2+9]}   k=8-15, rows 0-7
+    //   A[2]: {A[row+8, k_pair*2], ...}                  k=0-7,  rows 8-15
+    //   A[3]: {A[row+8, k_pair*2+8], ...}                k=8-15, rows 8-15
+    //   B[0]: {B[k_pair*2, col], B[k_pair*2+1, col]}     k=0-7
+    //   B[1]: {B[k_pair*2+8, col], ...}                  k=8-15
+    //
+    // m8n8k4 fragment layout (quadpair tid t = 0-7):
+    //   a0 = {A[t,0], A[t,1]}, a1 = {A[t,2], A[t,3]}
+    //   b0 = {B[0,t], B[1,t]}, b1 = {B[2,t], B[3,t]}
+    //   C output is scattered across 8 floats per thread
+    // ==========================================================================
+    
     const int lane = threadIdx.x % 32;
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     
-    // Thread position in Marlin layout
-    const int marlin_row = lane / 4;
-    const int marlin_col_pair = lane % 4;
-    
-    // Quadpair mapping: lanes 0-3 → tid 0-3, lanes 16-19 → tid 4-7
+    // Quadpair: lanes 0-3 → tid 0-3, lanes 16-19 → tid 4-7
     const int qp_tid = (lane < 4) ? lane : ((lane >= 16 && lane < 20) ? (lane - 16 + 4) : -1);
     const bool is_quadpair = (qp_tid >= 0);
     
-    // Accumulators for top/bottom 8x8 blocks
+    // Accumulators for top (rows 0-7) and bottom (rows 8-15) 8x8 blocks
     float c_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     float c_bot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     
-    // Process 4 k-blocks (k=0-3, 4-7, 8-11, 12-15)
+    // Process 4 k-blocks: kb=0 (k=0-3), kb=1 (k=4-7), kb=2 (k=8-11), kb=3 (k=12-15)
     #pragma unroll
     for (int kb = 0; kb < 4; kb++) {
-        int a_reg = (kb < 2) ? 0 : 1;
-        int b_reg = (kb < 2) ? 0 : 1;
+        // Which Marlin register holds this k-range
+        const int a_reg = (kb < 2) ? 0 : 1;  // A[0]/A[2] for k<8, A[1]/A[3] for k>=8
+        const int b_reg = (kb < 2) ? 0 : 1;  // B[0] for k<8, B[1] for k>=8
         
-        // Compute source lanes for shuffles
-        int row_for_a = is_quadpair ? qp_tid : 0;
-        int a_k_pair_lo = (kb % 2) * 2;
-        int a_k_pair_hi = a_k_pair_lo + 1;
-        int a_src_lane_lo = row_for_a * 4 + a_k_pair_lo;
-        int a_src_lane_hi = row_for_a * 4 + a_k_pair_hi;
+        // Which k_pair within that register (0,1 for first half, 2,3 for second half)
+        const int k_pair_base = (kb % 2) * 2;  // 0 for kb=0,2; 2 for kb=1,3
         
-        int col_for_b = is_quadpair ? qp_tid : 0;
-        int b_k_pair_lo = (kb % 2) * 2;
-        int b_k_pair_hi = b_k_pair_lo + 1;
-        int b_src_lane_lo = col_for_b * 4 + b_k_pair_lo;
-        int b_src_lane_hi = col_for_b * 4 + b_k_pair_hi;
-        
-        // Gather data via shuffles
-        uint32_t a_top_word_lo = __shfl_sync(FULL_MASK, A[a_reg], a_src_lane_lo);
-        uint32_t a_top_word_hi = __shfl_sync(FULL_MASK, A[a_reg], a_src_lane_hi);
-        uint32_t a_bot_word_lo = __shfl_sync(FULL_MASK, A[a_reg + 2], a_src_lane_lo);
-        uint32_t a_bot_word_hi = __shfl_sync(FULL_MASK, A[a_reg + 2], a_src_lane_hi);
-        uint32_t b_word_lo = __shfl_sync(FULL_MASK, B[b_reg], b_src_lane_lo);
-        uint32_t b_word_hi = __shfl_sync(FULL_MASK, B[b_reg], b_src_lane_hi);
+        // For m8n8k4: tid t needs row t of A and column t of B
+        // In Marlin layout: row r is at lane r*4+k_pair, col c is at lane c*4+k_pair
+        // So for tid t, we need lanes t*4+k_pair_base and t*4+k_pair_base+1
         
         uint32_t a_top0, a_top1, a_bot0, a_bot1, b0, b1;
         
         if (is_quadpair) {
-            // Repack to m8n8k4 format
-            half2 a_top_lo = *reinterpret_cast<half2*>(&a_top_word_lo);
-            half2 a_top_hi = *reinterpret_cast<half2*>(&a_top_word_hi);
-            half2 a_top_0 = __halves2half2(__low2half(a_top_lo), __high2half(a_top_lo));
-            half2 a_top_1 = __halves2half2(__low2half(a_top_hi), __high2half(a_top_hi));
-            a_top0 = *reinterpret_cast<uint32_t*>(&a_top_0);
-            a_top1 = *reinterpret_cast<uint32_t*>(&a_top_1);
+            // Source lanes for this quadpair thread
+            const int a_lane0 = qp_tid * 4 + k_pair_base;      // a0: {A[t,0], A[t,1]}
+            const int a_lane1 = qp_tid * 4 + k_pair_base + 1;  // a1: {A[t,2], A[t,3]}
+            const int b_lane0 = qp_tid * 4 + k_pair_base;      // b0: {B[0,t], B[1,t]}
+            const int b_lane1 = qp_tid * 4 + k_pair_base + 1;  // b1: {B[2,t], B[3,t]}
             
-            half2 a_bot_lo = *reinterpret_cast<half2*>(&a_bot_word_lo);
-            half2 a_bot_hi = *reinterpret_cast<half2*>(&a_bot_word_hi);
-            half2 a_bot_0 = __halves2half2(__low2half(a_bot_lo), __high2half(a_bot_lo));
-            half2 a_bot_1 = __halves2half2(__low2half(a_bot_hi), __high2half(a_bot_hi));
-            a_bot0 = *reinterpret_cast<uint32_t*>(&a_bot_0);
-            a_bot1 = *reinterpret_cast<uint32_t*>(&a_bot_1);
+            // Gather A for top rows (0-7) - data is already in correct half2 format!
+            a_top0 = __shfl_sync(FULL_MASK, A[a_reg], a_lane0);
+            a_top1 = __shfl_sync(FULL_MASK, A[a_reg], a_lane1);
             
-            half2 b_lo = *reinterpret_cast<half2*>(&b_word_lo);
-            half2 b_hi = *reinterpret_cast<half2*>(&b_word_hi);
-            half2 b_0 = __halves2half2(__low2half(b_lo), __high2half(b_lo));
-            half2 b_1 = __halves2half2(__low2half(b_hi), __high2half(b_hi));
-            b0 = *reinterpret_cast<uint32_t*>(&b_0);
-            b1 = *reinterpret_cast<uint32_t*>(&b_1);
+            // Gather A for bottom rows (8-15)
+            a_bot0 = __shfl_sync(FULL_MASK, A[a_reg + 2], a_lane0);
+            a_bot1 = __shfl_sync(FULL_MASK, A[a_reg + 2], a_lane1);
+            
+            // Gather B - data is already in correct half2 format!
+            b0 = __shfl_sync(FULL_MASK, B[b_reg], b_lane0);
+            b1 = __shfl_sync(FULL_MASK, B[b_reg], b_lane1);
         } else {
-            // Non-quadpair: zero values
-            half2 z = __halves2half2(__float2half(0.0f), __float2half(0.0f));
-            uint32_t zv = *reinterpret_cast<uint32_t*>(&z);
-            a_top0 = a_top1 = a_bot0 = a_bot1 = b0 = b1 = zv;
+            // Non-quadpair threads must still participate in mma.sync but with zeros
+            // They also need to participate in shuffles with valid source lanes
+            a_top0 = __shfl_sync(FULL_MASK, A[a_reg], k_pair_base);
+            a_top1 = __shfl_sync(FULL_MASK, A[a_reg], k_pair_base + 1);
+            a_bot0 = __shfl_sync(FULL_MASK, A[a_reg + 2], k_pair_base);
+            a_bot1 = __shfl_sync(FULL_MASK, A[a_reg + 2], k_pair_base + 1);
+            b0 = __shfl_sync(FULL_MASK, B[b_reg], k_pair_base);
+            b1 = __shfl_sync(FULL_MASK, B[b_reg], k_pair_base + 1);
+            
+            // Zero out for non-quadpair threads
+            a_top0 = a_top1 = a_bot0 = a_bot1 = b0 = b1 = 0;
         }
         
         // Execute tensor cores
@@ -398,30 +401,46 @@ __device__ __forceinline__ void mma_m16n8k16_sm70(
         mma_m8n8k4_sm70(a_bot0, a_bot1, b0, b1, c_bot);
     }
     
-    // Gather results back to Marlin layout
-    // Inverse mapping: t = (row%2) + 2*((col/2)%2) + 4*(row/4)
-    //                  i = (col%2) + 2*((row/2)%2) + 4*(col/4)
+    // ==========================================================================
+    // Gather scattered m8n8k4 output back to Marlin's frag_c layout
+    //
+    // m8n8k4 C layout is scattered: for tid t and index i:
+    //   row(t,i) = (t%2) + 2*((i/2)%2) + 4*(t/4)
+    //   col(t,i) = 2*((t/2)%2) + (i%2) + 4*(i/4)
+    //
+    // Marlin frag_c layout (lane = row*4 + col_pair):
+    //   frag_c[0]: C[row, col_pair*2]
+    //   frag_c[1]: C[row, col_pair*2+1]
+    //   frag_c[2]: C[row+8, col_pair*2]
+    //   frag_c[3]: C[row+8, col_pair*2+1]
+    // ==========================================================================
     
+    const int marlin_row = lane / 4;       // 0-7
+    const int marlin_col_pair = lane % 4;  // 0-3
+    
+    // For each Marlin output position, find which quadpair thread has it
     #define TID_TO_LANE(t) ((t) < 4 ? (t) : ((t) - 4 + 16))
-    #define GATHER_OUTPUT(c_arr, row, col, dst_idx) do { \
-        int t = ((row) % 2) + 2 * (((col) / 2) % 2) + 4 * ((row) / 4); \
-        int i = ((col) % 2) + 2 * (((row) / 2) % 2) + 4 * ((col) / 4); \
-        int src_lane = TID_TO_LANE(t); \
-        float vals[8]; \
-        _Pragma("unroll") \
-        for (int k = 0; k < 8; k++) vals[k] = __shfl_sync(FULL_MASK, c_arr[k], src_lane); \
-        frag_c[dst_idx] += vals[i]; \
-    } while(0)
     
-    int col0 = marlin_col_pair * 2;
-    int col1 = col0 + 1;
+    #pragma unroll
+    for (int out_idx = 0; out_idx < 4; out_idx++) {
+        // Target position in the 16x8 output matrix
+        const int row = (out_idx < 2) ? marlin_row : (marlin_row + 8);
+        const int col = marlin_col_pair * 2 + (out_idx % 2);
+        
+        // Use top or bottom accumulator
+        float* c_arr = (out_idx < 2) ? c_top : c_bot;
+        const int local_row = row % 8;  // Row within the 8x8 block
+        
+        // Inverse mapping: which tid t and index i has C[local_row, col]?
+        const int t = (local_row % 2) + 2 * ((col / 2) % 2) + 4 * (local_row / 4);
+        const int i = (col % 2) + 2 * ((local_row / 2) % 2) + 4 * (col / 4);
+        const int src_lane = TID_TO_LANE(t);
+        
+        // Shuffle to get the value from the thread that computed it
+        float val = __shfl_sync(FULL_MASK, c_arr[i], src_lane);
+        frag_c[out_idx] += val;
+    }
     
-    GATHER_OUTPUT(c_top, marlin_row, col0, 0);
-    GATHER_OUTPUT(c_top, marlin_row, col1, 1);
-    GATHER_OUTPUT(c_bot, marlin_row, col0, 2);
-    GATHER_OUTPUT(c_bot, marlin_row, col1, 3);
-    
-    #undef GATHER_OUTPUT
     #undef TID_TO_LANE
 }
 
@@ -437,6 +456,14 @@ __device__ __forceinline__ void mma_m16n8k16_sm70(
 // Parameter naming follows Marlin convention, NOT PTX convention:
 //   'a' (activations) → MMA's B operand
 //   'b'+'b2' (weights) → MMA's A operand
+//
+// PTX A operand register layout for m16n8k16:
+//   The inline asm uses: {b[0], b2[0], b[1], b2[1]}
+//   These map to PTX fragment positions:
+//     - b[0]  (a0) → rows 0-7,  k=0-7
+//     - b2[0] (a2) → rows 8-15, k=0-7  
+//     - b[1]  (a1) → rows 0-7,  k=8-15
+//     - b2[1] (a3) → rows 8-15, k=8-15
 //
 /// @brief Transposed multiply: C += (b,b2) * a
 /// @param marlin_a Activations (becomes MMA B)
@@ -466,13 +493,15 @@ __device__ void mma_m16n8k16_sm70_trans(
         int a_half = k % 2;
         
         // Get A values from weights
+        // PTX layout: b[0] = rows 0-7 k<8, b2[0] = rows 8-15 k<8
+        //             b[1] = rows 0-7 k>=8, b2[1] = rows 8-15 k>=8
         uint32_t a_top_raw, a_bot_raw;
         if (k < 8) {
-            a_top_raw = __shfl_sync(FULL_MASK, marlin_b[0], a_thread);
-            a_bot_raw = __shfl_sync(FULL_MASK, marlin_b[1], a_thread);
+            a_top_raw = __shfl_sync(FULL_MASK, marlin_b[0], a_thread);   // rows 0-7
+            a_bot_raw = __shfl_sync(FULL_MASK, marlin_b2[0], a_thread);  // rows 8-15
         } else {
-            a_top_raw = __shfl_sync(FULL_MASK, marlin_b2[0], a_thread);
-            a_bot_raw = __shfl_sync(FULL_MASK, marlin_b2[1], a_thread);
+            a_top_raw = __shfl_sync(FULL_MASK, marlin_b[1], a_thread);   // rows 0-7
+            a_bot_raw = __shfl_sync(FULL_MASK, marlin_b2[1], a_thread);  // rows 8-15
         }
         
         half2 a_top_h2 = *reinterpret_cast<half2*>(&a_top_raw);
