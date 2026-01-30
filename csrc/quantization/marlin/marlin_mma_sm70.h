@@ -404,6 +404,10 @@ __device__ __forceinline__ void mma_m16n8k16_sm70(
     // ==========================================================================
     // Gather scattered m8n8k4 output back to Marlin's frag_c layout
     //
+    // CRITICAL: __shfl_sync(mask, var, srcLane) evaluates 'var' on CALLING thread!
+    // So c_arr[i] is evaluated with THIS thread's i, not src_lane's i.
+    // We must shuffle ALL 8 elements, then select locally.
+    //
     // m8n8k4 C layout is scattered: for tid t and index i:
     //   row(t,i) = (t%2) + 2*((i/2)%2) + 4*(t/4)
     //   col(t,i) = 2*((t/2)%2) + (i%2) + 4*(i/4)
@@ -414,33 +418,41 @@ __device__ __forceinline__ void mma_m16n8k16_sm70(
     //   frag_c[2]: C[row+8, col_pair*2]
     //   frag_c[3]: C[row+8, col_pair*2+1]
     // ==========================================================================
-    
+
     const int marlin_row = lane / 4;       // 0-7
     const int marlin_col_pair = lane % 4;  // 0-3
-    
-    // For each Marlin output position, find which quadpair thread has it
+
     #define TID_TO_LANE(t) ((t) < 4 ? (t) : ((t) - 4 + 16))
-    
+
     #pragma unroll
     for (int out_idx = 0; out_idx < 4; out_idx++) {
         // Target position in the 16x8 output matrix
         const int row = (out_idx < 2) ? marlin_row : (marlin_row + 8);
         const int col = marlin_col_pair * 2 + (out_idx % 2);
-        
+
         // Use top or bottom accumulator
         float* c_arr = (out_idx < 2) ? c_top : c_bot;
         const int local_row = row % 8;  // Row within the 8x8 block
-        
+
         // Inverse mapping: which tid t and index i has C[local_row, col]?
         const int t = (local_row % 2) + 2 * ((col / 2) % 2) + 4 * (local_row / 4);
         const int i = (col % 2) + 2 * ((local_row / 2) % 2) + 4 * (col / 4);
         const int src_lane = TID_TO_LANE(t);
-        
-        // Shuffle to get the value from the thread that computed it
-        float val = __shfl_sync(FULL_MASK, c_arr[i], src_lane);
-        frag_c[out_idx] += val;
+
+        // Shuffle ALL 8 elements from src_lane, then select index i locally
+        float shfl_c[8];
+        shfl_c[0] = __shfl_sync(FULL_MASK, c_arr[0], src_lane);
+        shfl_c[1] = __shfl_sync(FULL_MASK, c_arr[1], src_lane);
+        shfl_c[2] = __shfl_sync(FULL_MASK, c_arr[2], src_lane);
+        shfl_c[3] = __shfl_sync(FULL_MASK, c_arr[3], src_lane);
+        shfl_c[4] = __shfl_sync(FULL_MASK, c_arr[4], src_lane);
+        shfl_c[5] = __shfl_sync(FULL_MASK, c_arr[5], src_lane);
+        shfl_c[6] = __shfl_sync(FULL_MASK, c_arr[6], src_lane);
+        shfl_c[7] = __shfl_sync(FULL_MASK, c_arr[7], src_lane);
+
+        frag_c[out_idx] += shfl_c[i];
     }
-    
+
     #undef TID_TO_LANE
 }
 
@@ -551,29 +563,41 @@ __device__ void mma_m16n8k16_sm70_trans(
     // ==========================================================================
     // Gather scattered m8n8k4 output back to Marlin's frag_c layout
     // Same as mma_m16n8k16_sm70 since output layout is the same
+    //
+    // CRITICAL: Must shuffle ALL 8 elements, then select locally.
     // ==========================================================================
-    
+
     const int marlin_row = lane / 4;       // 0-7
     const int marlin_col_pair = lane % 4;  // 0-3
-    
+
     #define TID_TO_LANE(t) ((t) < 4 ? (t) : ((t) - 4 + 16))
-    
+
     #pragma unroll
     for (int out_idx = 0; out_idx < 4; out_idx++) {
         const int row = (out_idx < 2) ? marlin_row : (marlin_row + 8);
         const int col = marlin_col_pair * 2 + (out_idx % 2);
-        
+
         float* c_arr = (out_idx < 2) ? c_top : c_bot;
         const int local_row = row % 8;
-        
+
         const int t = (local_row % 2) + 2 * ((col / 2) % 2) + 4 * (local_row / 4);
         const int i = (col % 2) + 2 * ((local_row / 2) % 2) + 4 * (col / 4);
         const int src_lane = TID_TO_LANE(t);
-        
-        float val = __shfl_sync(FULL_MASK, c_arr[i], src_lane);
-        frag_c[out_idx] += val;
+
+        // Shuffle ALL 8 elements from src_lane, then select index i locally
+        float shfl_c[8];
+        shfl_c[0] = __shfl_sync(FULL_MASK, c_arr[0], src_lane);
+        shfl_c[1] = __shfl_sync(FULL_MASK, c_arr[1], src_lane);
+        shfl_c[2] = __shfl_sync(FULL_MASK, c_arr[2], src_lane);
+        shfl_c[3] = __shfl_sync(FULL_MASK, c_arr[3], src_lane);
+        shfl_c[4] = __shfl_sync(FULL_MASK, c_arr[4], src_lane);
+        shfl_c[5] = __shfl_sync(FULL_MASK, c_arr[5], src_lane);
+        shfl_c[6] = __shfl_sync(FULL_MASK, c_arr[6], src_lane);
+        shfl_c[7] = __shfl_sync(FULL_MASK, c_arr[7], src_lane);
+
+        frag_c[out_idx] += shfl_c[i];
     }
-    
+
     #undef TID_TO_LANE
 }
 
