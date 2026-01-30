@@ -454,21 +454,26 @@ __device__ __forceinline__ void mma_m16n8k16_sm70(
 // -----------------------------------------------------------------------------
 //
 // Parameter naming follows Marlin convention, NOT PTX convention:
-//   'a' (activations) → MMA's B operand
-//   'b'+'b2' (weights) → MMA's A operand
+//   'marlin_a' (activations) → MMA's B operand (16×8 matrix)
+//   'marlin_b'+'marlin_b2' (weights) → MMA's A operand (16×16 matrix)
 //
-// PTX A operand register layout for m16n8k16:
-//   The inline asm uses: {b[0], b2[0], b[1], b2[1]}
-//   These map to PTX fragment positions:
-//     - b[0]  (a0) → rows 0-7,  k=0-7
-//     - b2[0] (a2) → rows 8-15, k=0-7  
-//     - b[1]  (a1) → rows 0-7,  k=8-15
-//     - b2[1] (a3) → rows 8-15, k=8-15
+// Marlin fragment layouts for trans (m_block_size_8 path):
+//   marlin_a: FragA loaded via ldsm<2> (only 2 registers for 8 rows)
+//     lane = col*4 + k_pair, where col∈[0,7], k_pair∈[0,3]
+//     marlin_a[0]: {B[k_pair*2, col], B[k_pair*2+1, col]}     k=0-7
+//     marlin_a[1]: {B[k_pair*2+8, col], B[k_pair*2+9, col]}   k=8-15
 //
-/// @brief Transposed multiply: C += (b,b2) * a
+//   marlin_b/b2: FragB (weights), each 2 registers
+//     lane = row*4 + k_pair, where row∈[0,7], k_pair∈[0,3]
+//     marlin_b[0]:  {A[row, k_pair*2], A[row, k_pair*2+1]}     rows 0-7,  k=0-7
+//     marlin_b[1]:  {A[row, k_pair*2+8], ...}                  rows 0-7,  k=8-15
+//     marlin_b2[0]: {A[row+8, k_pair*2], ...}                  rows 8-15, k=0-7
+//     marlin_b2[1]: {A[row+8, k_pair*2+8], ...}                rows 8-15, k=8-15
+//
+/// @brief Transposed multiply: C += (b,b2) * a using tensor cores
 /// @param marlin_a Activations (becomes MMA B)
-/// @param marlin_b Weights part 1 (becomes MMA A)
-/// @param marlin_b2 Weights part 2
+/// @param marlin_b Weights rows 0-7 (becomes MMA A top half)
+/// @param marlin_b2 Weights rows 8-15 (becomes MMA A bottom half)
 /// @param frag_c Output accumulator
 __device__ void mma_m16n8k16_sm70_trans(
     const uint32_t* marlin_a, 
@@ -476,70 +481,100 @@ __device__ void mma_m16n8k16_sm70_trans(
     const uint32_t* marlin_b2, 
     float* frag_c) 
 {
+    // ==========================================================================
+    // Emulates m16n8k16 trans using 8 m8n8k4 operations
+    // Trans: C[16×8] += A[16×16] × B[16×8]
+    //        where A = (marlin_b, marlin_b2), B = marlin_a
+    // ==========================================================================
+    
     const int lane = threadIdx.x % 32;
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     
-    const int out_row = lane / 4;
-    const int col_pair = lane % 4;
-    const int out_col0 = col_pair * 2;
-    const int out_col1 = col_pair * 2 + 1;
+    // Quadpair: lanes 0-3 → tid 0-3, lanes 16-19 → tid 4-7
+    const int qp_tid = (lane < 4) ? lane : ((lane >= 16 && lane < 20) ? (lane - 16 + 4) : -1);
+    const bool is_quadpair = (qp_tid >= 0);
     
-    float sum00 = 0, sum01 = 0, sum10 = 0, sum11 = 0;
+    // Accumulators for top (rows 0-7) and bottom (rows 8-15) 8x8 blocks
+    float c_top[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float c_bot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     
+    // Process 4 k-blocks: kb=0 (k=0-3), kb=1 (k=4-7), kb=2 (k=8-11), kb=3 (k=12-15)
     #pragma unroll
-    for (int k = 0; k < 16; k++) {
-        int a_k_pair = (k / 2) % 4;
-        int a_thread = out_row * 4 + a_k_pair;
-        int a_half = k % 2;
+    for (int kb = 0; kb < 4; kb++) {
+        // Which register holds this k-range
+        // For weights (A): marlin_b[0]/marlin_b2[0] for k<8, [1] for k>=8
+        // For activations (B): marlin_a[0] for k<8, marlin_a[1] for k>=8
+        const int weight_reg = (kb < 2) ? 0 : 1;
+        const int act_reg = (kb < 2) ? 0 : 1;
         
-        // Get A values from weights
-        // PTX layout: b[0] = rows 0-7 k<8, b2[0] = rows 8-15 k<8
-        //             b[1] = rows 0-7 k>=8, b2[1] = rows 8-15 k>=8
-        uint32_t a_top_raw, a_bot_raw;
-        if (k < 8) {
-            a_top_raw = __shfl_sync(FULL_MASK, marlin_b[0], a_thread);   // rows 0-7
-            a_bot_raw = __shfl_sync(FULL_MASK, marlin_b2[0], a_thread);  // rows 8-15
+        // Which k_pair within that register (0,1 for first half, 2,3 for second half)
+        const int k_pair_base = (kb % 2) * 2;  // 0 for kb=0,2; 2 for kb=1,3
+        
+        uint32_t a_top0, a_top1, a_bot0, a_bot1, b0, b1;
+        
+        if (is_quadpair) {
+            // For m8n8k4 A operand: tid t needs row t of the weight matrix
+            // Weight row r is at lane r*4+k_pair in marlin_b/marlin_b2
+            const int a_lane0 = qp_tid * 4 + k_pair_base;
+            const int a_lane1 = qp_tid * 4 + k_pair_base + 1;
+            
+            // Gather weights for A operand (top and bottom halves)
+            a_top0 = __shfl_sync(FULL_MASK, marlin_b[weight_reg], a_lane0);
+            a_top1 = __shfl_sync(FULL_MASK, marlin_b[weight_reg], a_lane1);
+            a_bot0 = __shfl_sync(FULL_MASK, marlin_b2[weight_reg], a_lane0);
+            a_bot1 = __shfl_sync(FULL_MASK, marlin_b2[weight_reg], a_lane1);
+            
+            // For m8n8k4 B operand: tid t needs column t of the activation matrix
+            // Activation col c is at lane c*4+k_pair in marlin_a
+            const int b_lane0 = qp_tid * 4 + k_pair_base;
+            const int b_lane1 = qp_tid * 4 + k_pair_base + 1;
+            
+            b0 = __shfl_sync(FULL_MASK, marlin_a[act_reg], b_lane0);
+            b1 = __shfl_sync(FULL_MASK, marlin_a[act_reg], b_lane1);
         } else {
-            a_top_raw = __shfl_sync(FULL_MASK, marlin_b[1], a_thread);   // rows 0-7
-            a_bot_raw = __shfl_sync(FULL_MASK, marlin_b2[1], a_thread);  // rows 8-15
+            // Non-quadpair: participate in shuffles but use zeros
+            a_top0 = __shfl_sync(FULL_MASK, marlin_b[weight_reg], k_pair_base);
+            a_top1 = __shfl_sync(FULL_MASK, marlin_b[weight_reg], k_pair_base + 1);
+            a_bot0 = __shfl_sync(FULL_MASK, marlin_b2[weight_reg], k_pair_base);
+            a_bot1 = __shfl_sync(FULL_MASK, marlin_b2[weight_reg], k_pair_base + 1);
+            b0 = __shfl_sync(FULL_MASK, marlin_a[act_reg], k_pair_base);
+            b1 = __shfl_sync(FULL_MASK, marlin_a[act_reg], k_pair_base + 1);
+            
+            a_top0 = a_top1 = a_bot0 = a_bot1 = b0 = b1 = 0;
         }
         
-        half2 a_top_h2 = *reinterpret_cast<half2*>(&a_top_raw);
-        half2 a_bot_h2 = *reinterpret_cast<half2*>(&a_bot_raw);
-        
-        float a_top = (a_half == 0) ? __half2float(__low2half(a_top_h2)) 
-                                    : __half2float(__high2half(a_top_h2));
-        float a_bot = (a_half == 0) ? __half2float(__low2half(a_bot_h2))
-                                    : __half2float(__high2half(a_bot_h2));
-        
-        // Get B values from activations
-        int b_k_pair = (k / 2) % 4;
-        int b_thread0 = out_col0 * 4 + b_k_pair;
-        int b_thread1 = out_col1 * 4 + b_k_pair;
-        int b_reg_idx = (k < 8) ? 0 : 1;
-        int b_half = k % 2;
-        
-        uint32_t b0_raw = __shfl_sync(FULL_MASK, marlin_a[b_reg_idx], b_thread0);
-        uint32_t b1_raw = __shfl_sync(FULL_MASK, marlin_a[b_reg_idx], b_thread1);
-        
-        half2 b0_h2 = *reinterpret_cast<half2*>(&b0_raw);
-        half2 b1_h2 = *reinterpret_cast<half2*>(&b1_raw);
-        
-        float b0_val = (b_half == 0) ? __half2float(__low2half(b0_h2))
-                                     : __half2float(__high2half(b0_h2));
-        float b1_val = (b_half == 0) ? __half2float(__low2half(b1_h2))
-                                     : __half2float(__high2half(b1_h2));
-        
-        sum00 += a_top * b0_val;
-        sum01 += a_top * b1_val;
-        sum10 += a_bot * b0_val;
-        sum11 += a_bot * b1_val;
+        // Execute tensor cores
+        mma_m8n8k4_sm70(a_top0, a_top1, b0, b1, c_top);
+        mma_m8n8k4_sm70(a_bot0, a_bot1, b0, b1, c_bot);
     }
     
-    frag_c[0] += sum00;
-    frag_c[1] += sum01;
-    frag_c[2] += sum10;
-    frag_c[3] += sum11;
+    // ==========================================================================
+    // Gather scattered m8n8k4 output back to Marlin's frag_c layout
+    // Same as mma_m16n8k16_sm70 since output layout is the same
+    // ==========================================================================
+    
+    const int marlin_row = lane / 4;       // 0-7
+    const int marlin_col_pair = lane % 4;  // 0-3
+    
+    #define TID_TO_LANE(t) ((t) < 4 ? (t) : ((t) - 4 + 16))
+    
+    #pragma unroll
+    for (int out_idx = 0; out_idx < 4; out_idx++) {
+        const int row = (out_idx < 2) ? marlin_row : (marlin_row + 8);
+        const int col = marlin_col_pair * 2 + (out_idx % 2);
+        
+        float* c_arr = (out_idx < 2) ? c_top : c_bot;
+        const int local_row = row % 8;
+        
+        const int t = (local_row % 2) + 2 * ((col / 2) % 2) + 4 * (local_row / 4);
+        const int i = (col % 2) + 2 * ((local_row / 2) % 2) + 4 * (col / 4);
+        const int src_lane = TID_TO_LANE(t);
+        
+        float val = __shfl_sync(FULL_MASK, c_arr[i], src_lane);
+        frag_c[out_idx] += val;
+    }
+    
+    #undef TID_TO_LANE
 }
 
 // -----------------------------------------------------------------------------
