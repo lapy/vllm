@@ -168,6 +168,7 @@ using namespace nvcuda;
 /// @brief Emulates ldmatrix.sync.aligned.m8n8.x1.shared.b16
 /// @param dst Output register (1 uint32)
 /// @param smem_ptr Pointer to shared memory (each thread provides its row)
+/// @note Loads one 8x8 matrix. Threads 0-7 provide rows 0-7.
 __device__ __forceinline__ void ldmatrix_m8n8_x1_sm70(
     uint32_t* dst,
     const void* smem_ptr)
@@ -175,19 +176,34 @@ __device__ __forceinline__ void ldmatrix_m8n8_x1_sm70(
     const int lane = threadIdx.x % 32;
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     
+    // Each thread loads 4 uint32 (16 bytes = 8 halves) from its row
     const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(smem_ptr);
-    uint32_t my_word = row_ptr[0];
+    uint32_t my_words[4] = {row_ptr[0], row_ptr[1], row_ptr[2], row_ptr[3]};
     
-    int source_row = lane % 8;
-    int warp_group_offset = (lane / 8) * 8;
-    int src_lane = warp_group_offset + source_row;
+    // For x1: only one 8x8 matrix, threads 0-7 provide rows 0-7
+    // Threads 8-15, 16-23, 24-31 get the same data as their counterparts in 0-7
+    int out_row = lane / 4;      // 0-7 for first 32 lanes (wraps at 8)
+    int k_pair = lane % 4;       // Which of 4 words in the row
     
-    dst[0] = __shfl_sync(FULL_MASK, my_word, src_lane);
+    // Source lane is the thread that has the row we need (mod 8)
+    int src_lane = out_row % 8;
+    
+    // Get all 4 words from the source lane
+    uint32_t w0 = __shfl_sync(FULL_MASK, my_words[0], src_lane);
+    uint32_t w1 = __shfl_sync(FULL_MASK, my_words[1], src_lane);
+    uint32_t w2 = __shfl_sync(FULL_MASK, my_words[2], src_lane);
+    uint32_t w3 = __shfl_sync(FULL_MASK, my_words[3], src_lane);
+    
+    uint32_t arr[4] = {w0, w1, w2, w3};
+    dst[0] = arr[k_pair];
 }
 
 /// @brief Emulates ldmatrix.sync.aligned.m8n8.x2.shared.b16
 /// @param dst Output registers (2 uint32)
 /// @param smem_ptr Pointer to shared memory
+/// @note Loads two 8x8 matrices. Each thread loads 16 bytes (4 uint32) from its row.
+///       The instruction then redistributes so each thread gets one element from
+///       each of the two matrices.
 __device__ __forceinline__ void ldmatrix_m8n8_x2_sm70(
     uint32_t* dst,
     const void* smem_ptr)
@@ -195,15 +211,37 @@ __device__ __forceinline__ void ldmatrix_m8n8_x2_sm70(
     const int lane = threadIdx.x % 32;
     const uint32_t FULL_MASK = 0xFFFFFFFF;
     
+    // Each thread loads 4 uint32 (16 bytes = 8 halves) from its row
     const uint32_t* row_ptr = reinterpret_cast<const uint32_t*>(smem_ptr);
-    uint32_t my_words[2] = {row_ptr[0], row_ptr[1]};
+    uint32_t my_words[4] = {row_ptr[0], row_ptr[1], row_ptr[2], row_ptr[3]};
     
-    int row_in_tile = lane % 8;
-    int warp_group_offset = (lane / 8) * 8;
-    int src_lane = warp_group_offset + row_in_tile;
-
-    dst[0] = __shfl_sync(FULL_MASK, my_words[0], src_lane);
-    dst[1] = __shfl_sync(FULL_MASK, my_words[1], src_lane);
+    // For x2: threads 0-15 provide rows 0-15, threads 16-31 wrap around
+    // Output mapping: lane -> (src_row, word_idx)
+    // reg[0] gets from rows 0-7 (first matrix)
+    // reg[1] gets from rows 8-15 (second matrix)
+    int out_row = lane / 4;      // 0-7 for 32 threads
+    int k_pair = lane % 4;       // Which of 4 words in the row
+    
+    // Source lanes: first 8 threads (0-7) have rows 0-7, next 8 (8-15) have rows 8-15
+    int src_lane_mat0 = out_row;           // Rows 0-7 from threads 0-7
+    int src_lane_mat1 = out_row + 8;       // Rows 8-15 from threads 8-15
+    
+    // Get words from source lanes
+    uint32_t w0_mat0 = __shfl_sync(FULL_MASK, my_words[0], src_lane_mat0);
+    uint32_t w1_mat0 = __shfl_sync(FULL_MASK, my_words[1], src_lane_mat0);
+    uint32_t w2_mat0 = __shfl_sync(FULL_MASK, my_words[2], src_lane_mat0);
+    uint32_t w3_mat0 = __shfl_sync(FULL_MASK, my_words[3], src_lane_mat0);
+    
+    uint32_t w0_mat1 = __shfl_sync(FULL_MASK, my_words[0], src_lane_mat1);
+    uint32_t w1_mat1 = __shfl_sync(FULL_MASK, my_words[1], src_lane_mat1);
+    uint32_t w2_mat1 = __shfl_sync(FULL_MASK, my_words[2], src_lane_mat1);
+    uint32_t w3_mat1 = __shfl_sync(FULL_MASK, my_words[3], src_lane_mat1);
+    
+    uint32_t arr_mat0[4] = {w0_mat0, w1_mat0, w2_mat0, w3_mat0};
+    uint32_t arr_mat1[4] = {w0_mat1, w1_mat1, w2_mat1, w3_mat1};
+    
+    dst[0] = arr_mat0[k_pair];
+    dst[1] = arr_mat1[k_pair];
 }
 
 /// @brief Emulates ldmatrix.sync.aligned.m8n8.x4.shared.b16
