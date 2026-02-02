@@ -1538,7 +1538,7 @@ __global__ void Marlin(
       }
 
       if constexpr (group_blocks != -1) {
-        if (group_blocks == 2 || k == 1) {
+        if (group_blocks <= 2 || k == 1) {
           if constexpr (a_type == vllm::kS8) {
             int2 s_vals[2];
             s_vals[0] = {
