@@ -228,6 +228,55 @@ def generate_new_kernels():
                     config_sm70 = config.copy()
                     config_sm70["stages"] = 2
                     sm_70_result_dict[(a_type, b_type, c_type)].append(config_sm70)
+
+            # Generate additional SM70-specific configs for better K divisibility
+            if SUPPORT_SM70 and (a_type, b_type, c_type) in sm_70_result_dict:
+                for group_blocks, m_blocks in itertools.product(
+                    all_group_blocks, all_m_blocks
+                ):
+                    # SM70 additional large batch configs: (32, 512, 256) and (32, 1024, 256)
+                    # These provide thread_k=32 for cases where K is not divisible by 64
+                    if m_blocks > 1:
+                        for thread_k, thread_n, threads in [
+                            (32, 512, 256),
+                            (32, 1024, 256),
+                        ]:
+                            config_sm70_extra = {
+                                "threads": threads,
+                                "s_type": s_type,
+                                "thread_m_blocks": max(m_blocks, 1),
+                                "thread_k_blocks": thread_k // 16,
+                                "thread_n_blocks": thread_n // 16,
+                                "m_block_size_8": "false",
+                                "stages": 2,
+                                "group_blocks": group_blocks,
+                                "is_zp_float": "false",
+                            }
+                            sm_70_result_dict[(a_type, b_type, c_type)].append(
+                                config_sm70_extra
+                            )
+
+                    # SM70 additional small batch configs: (16, 256, 128) and (16, 512, 128)
+                    # These provide thread_k=16 for cases where K is not divisible by 64/128
+                    if m_blocks <= 1:
+                        for thread_k, thread_n, threads in [
+                            (16, 256, 128),
+                            (16, 512, 128),
+                        ]:
+                            config_sm70_extra = {
+                                "threads": threads,
+                                "s_type": s_type,
+                                "thread_m_blocks": max(m_blocks, 1),
+                                "thread_k_blocks": thread_k // 16,
+                                "thread_n_blocks": thread_n // 16,
+                                "m_block_size_8": "true" if m_blocks == 0.5 else "false",
+                                "stages": 2,
+                                "group_blocks": group_blocks,
+                                "is_zp_float": "false",
+                            }
+                            sm_70_result_dict[(a_type, b_type, c_type)].append(
+                                config_sm70_extra
+                            )
  
     kernel_selector_str = FILE_HEAD_COMMENT
 
