@@ -71,21 +71,21 @@ QUANT_CONFIGS = [
         "b_type": "kU4",
         "thread_configs": THREAD_CONFIGS,
         "thread_m_blocks": THREAD_M_BLOCKS,
-        "group_blocks": [-1, 2, 4, 8],
+        "group_blocks": [-1, 1, 2, 4, 8],
     },
     # GPTQ-INT4
     {
         "b_type": "kU4B8",
         "thread_configs": THREAD_CONFIGS,
         "thread_m_blocks": THREAD_M_BLOCKS,
-        "group_blocks": [-1, 0, 2, 4, 8],
+        "group_blocks": [-1, 0, 1, 2, 4, 8],
     },
     # AWQ-INT8
     {
         "b_type": "kU8B128",
         "thread_configs": THREAD_CONFIGS,
         "thread_m_blocks": THREAD_M_BLOCKS,
-        "group_blocks": [-1, 0, 2, 4, 8],
+        "group_blocks": [-1, 0, 1, 2, 4, 8],
     },
     # FP8
     {
